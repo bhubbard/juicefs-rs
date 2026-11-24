@@ -21,4 +21,9 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "vfs_bench"
+harness = false
