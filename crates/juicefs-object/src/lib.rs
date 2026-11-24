@@ -1,5 +1,6 @@
-//! Object storage abstraction and backends (`Memory`, `File`, `S3`, `Encrypted`, `Sharded`) for `JuiceFS`.
+//! Object storage abstraction and backends (`Memory`, `File`, `S3`, `Gcs`, `Azure`, `Encrypted`, `Sharded`) for `JuiceFS`.
 
+pub mod cloud;
 pub mod encrypt;
 pub mod error;
 pub mod file;
@@ -16,6 +17,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use juicefs_core::Format;
 
+pub use cloud::{AzureStore, GcsStore};
 pub use encrypt::EncryptedStore;
 pub use error::ObjectError;
 pub use file::FileStore;
@@ -195,7 +197,11 @@ pub fn open_from_format(format: &Format) -> Result<Arc<dyn ObjectStorage>, Objec
                 .unwrap_or(&format.bucket);
             Arc::new(FileStore::new(root)?)
         }
-        "s3" => Arc::new(S3Store::from_format(format)?),
+        "s3" | "oss" | "cos" | "minio" | "b2" | "obs" | "bos" | "tos" => {
+            Arc::new(S3Store::from_format(format)?)
+        }
+        "gs" | "gcs" => Arc::new(GcsStore::from_format(format)?),
+        "azblob" | "azure" | "wasb" => Arc::new(AzureStore::from_format(format)?),
         other => {
             return Err(ObjectError::UnsupportedBackend(other.to_owned()));
         }

@@ -14,6 +14,7 @@ use juicefs_meta::{Meta, open_meta};
 use juicefs_object::{FileStore, MemoryStore, ObjectStorage, S3Store};
 use juicefs_sync::{SyncConfig, sync_objects};
 use juicefs_vfs::Vfs;
+use juicefs_webdav::WebDavServer;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -265,6 +266,14 @@ enum Commands {
         meta_url: String,
         /// Socket address to listen on
         #[arg(long, default_value = "127.0.0.1:9000")]
+        listen: SocketAddr,
+    },
+    /// Start a `WebDAV` HTTP server backed by a `JuiceFS` volume
+    Webdav {
+        /// Metadata URL
+        meta_url: String,
+        /// Socket address to listen on
+        #[arg(long, default_value = "127.0.0.1:9007")]
         listen: SocketAddr,
     },
 }
@@ -719,6 +728,13 @@ async fn dispatch(command: Commands) -> Result<()> {
             let vfs = connect_vfs(&meta_url).await?;
             let server = GatewayServer::bind(listen, vfs).await?;
             println!("S3 Gateway listening on http://{}", server.local_addr());
+            tokio::signal::ctrl_c().await?;
+            server.shutdown().await;
+        }
+        Commands::Webdav { meta_url, listen } => {
+            let vfs = connect_vfs(&meta_url).await?;
+            let server = WebDavServer::bind(listen, vfs).await?;
+            println!("WebDAV server listening on http://{}", server.local_addr());
             tokio::signal::ctrl_c().await?;
             server.shutdown().await;
         }

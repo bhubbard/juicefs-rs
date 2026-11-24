@@ -1,0 +1,43 @@
+[package]
+name = "juicefs-webdav"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.88"
+description = "WebDAV HTTP server backed by JuiceFS VFS"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+
+[dependencies]
+bytes = "1"
+chrono = "0.4"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+juicefs-core = { path = "../juicefs-core" }
+juicefs-meta = { path = "../juicefs-meta" }
+juicefs-vfs = { path = "../juicefs-vfs" }
+md-5 = "0.10"
+percent-encoding = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+hyper = { version = "1", features = ["client", "http1"] }
+quick-xml = "0.38"

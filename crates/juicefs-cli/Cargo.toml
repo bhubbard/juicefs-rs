@@ -22,6 +22,7 @@ juicefs-meta.workspace = true
 juicefs-object.workspace = true
 juicefs-sync.workspace = true
 juicefs-vfs.workspace = true
+juicefs-webdav.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

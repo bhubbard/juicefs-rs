@@ -8,6 +8,8 @@ members = [
     "crates/juicefs-vfs",
     "crates/juicefs-sync",
     "crates/juicefs-gateway",
+    "crates/juicefs-webdav",
+    "crates/juicefs-metric",
     "crates/juicefs-cli",
 ]
 
@@ -40,6 +42,7 @@ juicefs-meta = { path = "crates/juicefs-meta" }
 juicefs-vfs = { path = "crates/juicefs-vfs" }
 juicefs-sync = { path = "crates/juicefs-sync" }
 juicefs-gateway = { path = "crates/juicefs-gateway" }
+juicefs-webdav = { path = "crates/juicefs-webdav" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -48,7 +51,7 @@ clap = { version = "4", features = ["derive", "env"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 futures = "0.3"
 lz4_flex = "0.11"
-object_store = { version = "0.12", features = ["aws"] }
+object_store = { version = "0.12", features = ["aws", "gcp", "azure"] }
 parking_lot = "0.12"
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use juicefs_core::Format;
 use juicefs_object::{
-    EncryptedStore, FileStore, MemoryStore, ObjectError, ObjectStorage, Part, PrefixedStore,
-    ShardedStore,
+    AzureStore, EncryptedStore, FileStore, GcsStore, MemoryStore, ObjectError, ObjectStorage, Part,
+    PrefixedStore, S3Store, ShardedStore, open_from_format,
 };
 use tempfile::tempdir;
 
@@ -544,4 +545,152 @@ async fn test_sharded_store_distribution_and_operations() {
     // Verify list-prefix boundary and multipart on ShardedStore.
     run_list_prefix_boundary(Arc::new(store.clone())).await;
     run_multipart_suite(&store).await;
+}
+
+#[test]
+fn test_gcs_store_from_format_and_invalid_urls() {
+    let fmt = Format::new("vol", "gs", "gs://my-gcs-bucket/path/to/prefix");
+    let store = GcsStore::from_format(&fmt).expect("valid gs:// url");
+    assert_eq!(store.description(), "gs://my-gcs-bucket/path/to/prefix");
+    assert_eq!(store.base_prefix(), "path/to/prefix");
+    assert!(store.limits().is_support_multipart_upload);
+
+    let root_fmt = Format::new("vol", "gcs", "gs://my-gcs-bucket");
+    let root_store = GcsStore::from_format(&root_fmt).expect("gs:// without prefix");
+    assert_eq!(root_store.base_prefix(), "");
+
+    let gcs_scheme_fmt = Format::new("vol", "gcs", "gcs://my-gcs-bucket/sub/");
+    let gcs_scheme_store = GcsStore::from_format(&gcs_scheme_fmt).expect("gcs:// url");
+    assert_eq!(gcs_scheme_store.base_prefix(), "sub");
+
+    for bad_url in [
+        "",
+        "://bad-url",
+        "gs:///missing-bucket",
+        "s3://wrong/prefix",
+    ] {
+        let bad_fmt = Format::new("vol", "gs", bad_url);
+        let err = GcsStore::from_format(&bad_fmt).expect_err("expected invalid gcs url error");
+        assert!(
+            matches!(err, ObjectError::Backend(_)),
+            "unexpected error for '{bad_url}': {err:?}"
+        );
+    }
+}
+
+#[test]
+fn test_azure_store_from_format_and_invalid_urls() {
+    let mut azblob_fmt = Format::new("vol", "azblob", "azblob://my-container/az/prefix");
+    azblob_fmt.access_key = "myaccount".to_owned();
+    azblob_fmt.secret_key = "dGVzdGtleQ==".to_owned();
+    let azblob_store = AzureStore::from_format(&azblob_fmt).expect("valid azblob:// url");
+    assert_eq!(
+        azblob_store.description(),
+        "azblob://my-container/az/prefix"
+    );
+    assert_eq!(azblob_store.base_prefix(), "az/prefix");
+    let limits = azblob_store.limits();
+    assert!(limits.is_support_multipart_upload);
+    assert_eq!(limits.max_part_count, 50_000);
+
+    let mut wasb_fmt = Format::new("vol", "wasb", "wasb://my-container/wasb/prefix/");
+    wasb_fmt.access_key = "myaccount".to_owned();
+    let wasb_store = AzureStore::from_format(&wasb_fmt).expect("valid wasb:// url");
+    assert_eq!(wasb_store.base_prefix(), "wasb/prefix");
+
+    let wasb_full_fmt = Format::new(
+        "vol",
+        "wasb",
+        "wasb://my-container@myaccount.blob.core.windows.net/nested/prefix",
+    );
+    let wasb_full_store =
+        AzureStore::from_format(&wasb_full_fmt).expect("wasb:// with embedded account");
+    assert_eq!(wasb_full_store.base_prefix(), "nested/prefix");
+
+    let https_fmt = Format::new(
+        "vol",
+        "azure",
+        "https://myaccount.blob.core.windows.net/my-container/https/prefix",
+    );
+    let https_store = AzureStore::from_format(&https_fmt).expect("https azure blob url");
+    assert_eq!(https_store.base_prefix(), "https/prefix");
+
+    for bad_url in [
+        "",
+        "://bad-url",
+        "azblob:///missing-container",
+        "wasb:///missing-container",
+        "s3://wrong-scheme/prefix",
+        "https://myaccount.blob.core.windows.net/",
+    ] {
+        let mut bad_fmt = Format::new("vol", "azblob", bad_url);
+        bad_fmt.access_key = "myaccount".to_owned();
+        let err = AzureStore::from_format(&bad_fmt).expect_err("expected invalid azure url error");
+        assert!(
+            matches!(err, ObjectError::Backend(_)),
+            "unexpected error for '{bad_url}': {err:?}"
+        );
+    }
+
+    let mut bad_key_fmt = Format::new("vol", "azblob", "azblob://my-container/prefix");
+    bad_key_fmt.access_key = "myaccount".to_owned();
+    bad_key_fmt.secret_key = "not-valid-base64!!!".to_owned();
+    assert!(matches!(
+        AzureStore::from_format(&bad_key_fmt),
+        Err(ObjectError::Backend(_))
+    ));
+}
+
+#[test]
+fn test_s3_store_from_format_and_invalid_urls() {
+    let fmt = Format::new("vol", "s3", "s3://my-bucket/s3/prefix/");
+    let store = S3Store::from_format(&fmt).expect("valid s3:// url");
+    assert_eq!(store.description(), "s3://my-bucket/s3/prefix/");
+    assert_eq!(store.base_prefix(), "s3/prefix");
+
+    for bad_url in ["", "://bad-url", "s3:///missing-bucket"] {
+        let bad_fmt = Format::new("vol", "s3", bad_url);
+        assert!(matches!(
+            S3Store::from_format(&bad_fmt),
+            Err(ObjectError::Backend(_))
+        ));
+    }
+}
+
+#[test]
+fn test_open_from_format_cloud_dispatch() {
+    for storage in ["s3", "oss", "cos", "minio", "b2", "obs", "bos", "tos"] {
+        let url = format!("{storage}://my-bucket/prefix");
+        let fmt = Format::new("vol", storage, &url);
+        let store = open_from_format(&fmt)
+            .unwrap_or_else(|e| panic!("open_from_format failed for '{storage}': {e}"));
+        assert_eq!(store.description(), format!("{url}vol/"));
+    }
+
+    for (storage, name, expected_suffix) in [("gs", "vol", "vol/"), ("gcs", "", "")] {
+        let url = "gs://gcs-bucket/prefix";
+        let fmt = Format::new(name, storage, url);
+        let store = open_from_format(&fmt)
+            .unwrap_or_else(|e| panic!("open_from_format failed for '{storage}': {e}"));
+        assert_eq!(store.description(), format!("{url}{expected_suffix}"));
+    }
+
+    for storage in ["azblob", "azure", "wasb"] {
+        let url = format!("{storage}://my-container/prefix");
+        let mut fmt = Format::new("vol", storage, &url);
+        fmt.access_key = "myaccount".to_owned();
+        let store = open_from_format(&fmt)
+            .unwrap_or_else(|e| panic!("open_from_format failed for '{storage}': {e}"));
+        assert_eq!(store.description(), format!("{url}vol/"));
+    }
+
+    let upper_fmt = Format::new("", "GCS", "gs://gcs-bucket/prefix");
+    let upper_store = open_from_format(&upper_fmt).expect("case-insensitive storage dispatch");
+    assert_eq!(upper_store.description(), "gs://gcs-bucket/prefix");
+
+    let unsupported = Format::new("vol", "swift", "swift://container/prefix");
+    assert!(matches!(
+        open_from_format(&unsupported),
+        Err(ObjectError::UnsupportedBackend(name)) if name == "swift"
+    ));
 }

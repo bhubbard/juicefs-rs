@@ -1014,6 +1014,7 @@ dependencies = [
  "juicefs-object",
  "juicefs-sync",
  "juicefs-vfs",
+ "juicefs-webdav",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1070,6 +1071,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "juicefs-metric"
+version = "0.1.0"
+
+[[package]]
 name = "juicefs-object"
 version = "0.1.0"
 dependencies = [
@@ -1116,6 +1121,28 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "juicefs-webdav"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "juicefs-core",
+ "juicefs-meta",
+ "juicefs-vfs",
+ "md-5",
+ "percent-encoding",
+ "quick-xml",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1251,6 +1278,7 @@ dependencies = [
  "futures",
  "http",
  "http-body-util",
+ "httparse",
  "humantime",
  "hyper",
  "itertools 0.14.0",
@@ -1261,6 +1289,7 @@ dependencies = [
  "rand 0.9.5",
  "reqwest",
  "ring",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -1706,6 +1735,15 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
