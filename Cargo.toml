@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/juicefs-core",
+    "crates/juicefs-object",
+    "crates/juicefs-chunk",
+    "crates/juicefs-meta",
+    "crates/juicefs-vfs",
+    "crates/juicefs-sync",
+    "crates/juicefs-gateway",
+    "crates/juicefs-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.88"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+
+[workspace.dependencies]
+juicefs-core = { path = "crates/juicefs-core" }
+juicefs-object = { path = "crates/juicefs-object" }
+juicefs-chunk = { path = "crates/juicefs-chunk" }
+juicefs-meta = { path = "crates/juicefs-meta" }
+juicefs-vfs = { path = "crates/juicefs-vfs" }
+juicefs-sync = { path = "crates/juicefs-sync" }
+juicefs-gateway = { path = "crates/juicefs-gateway" }
+
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+lz4_flex = "0.11"
+object_store = { version = "0.12", features = ["aws"] }
+parking_lot = "0.12"
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+zstd = "0.13"

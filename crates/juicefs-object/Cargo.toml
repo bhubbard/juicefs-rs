@@ -1,0 +1,25 @@
+[package]
+name = "juicefs-object"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+juicefs-core.workspace = true
+object_store.workspace = true
+parking_lot.workspace = true
+ring = "0.17"
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,2472 @@
+//! `SQLite` metadata engine compatible with `JuiceFS` SQL schema conventions.
+
+use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use juicefs_core::{
+    Attr, CHUNK_SIZE, Entry, Format, Ino, MAX_NAME, MAX_SYMLINK, NodeType, ROOT_INODE, SLICE_BYTES,
+    SetAttrFlags, Slice, SliceRecord, StatFs, TRASH_INODE, build_slice, decode_slices,
+    encode_slice,
+};
+use parking_lot::Mutex;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+
+use crate::{FlockType, FsckReport, Meta, MetaError, NlinkMismatch, PlockRecord, Quota};
+
+const SCHEMA_SQL: &str = r"
+CREATE TABLE IF NOT EXISTS jfs_setting (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jfs_counter (
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jfs_edge (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    parent INTEGER NOT NULL,
+    name BLOB NOT NULL,
+    inode INTEGER NOT NULL,
+    type INTEGER NOT NULL,
+    UNIQUE(parent, name)
+);
+CREATE INDEX IF NOT EXISTS idx_jfs_edge_inode ON jfs_edge(inode);
+CREATE TABLE IF NOT EXISTS jfs_node (
+    inode INTEGER PRIMARY KEY,
+    type INTEGER NOT NULL,
+    flags INTEGER NOT NULL,
+    mode INTEGER NOT NULL,
+    uid INTEGER NOT NULL,
+    gid INTEGER NOT NULL,
+    atime INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    ctime INTEGER NOT NULL,
+    atimensec INTEGER NOT NULL DEFAULT 0,
+    mtimensec INTEGER NOT NULL DEFAULT 0,
+    ctimensec INTEGER NOT NULL DEFAULT 0,
+    nlink INTEGER NOT NULL,
+    length INTEGER NOT NULL,
+    rdev INTEGER NOT NULL DEFAULT 0,
+    parent INTEGER NOT NULL DEFAULT 0,
+    access_acl_id INTEGER NOT NULL DEFAULT 0,
+    default_acl_id INTEGER NOT NULL DEFAULT 0,
+    tier_id INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS jfs_chunk (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inode INTEGER NOT NULL,
+    indx INTEGER NOT NULL,
+    slices BLOB NOT NULL,
+    UNIQUE(inode, indx)
+);
+CREATE TABLE IF NOT EXISTS jfs_slice_ref (
+    id INTEGER PRIMARY KEY,
+    size INTEGER NOT NULL,
+    refs INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jfs_slice_ref_refs ON jfs_slice_ref(refs);
+CREATE TABLE IF NOT EXISTS jfs_symlink (
+    inode INTEGER PRIMARY KEY,
+    target BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jfs_xattr (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inode INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    value BLOB NOT NULL,
+    UNIQUE(inode, name)
+);
+CREATE TABLE IF NOT EXISTS jfs_flock (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inode INTEGER NOT NULL,
+    sid INTEGER NOT NULL DEFAULT 0,
+    owner INTEGER NOT NULL,
+    ltype INTEGER NOT NULL,
+    UNIQUE(inode, sid, owner)
+);
+CREATE TABLE IF NOT EXISTS jfs_plock (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inode INTEGER NOT NULL,
+    sid INTEGER NOT NULL DEFAULT 0,
+    owner INTEGER NOT NULL,
+    records BLOB NOT NULL,
+    UNIQUE(inode, sid, owner)
+);
+CREATE TABLE IF NOT EXISTS jfs_dir_quota (
+    inode INTEGER PRIMARY KEY,
+    max_space INTEGER NOT NULL,
+    max_inodes INTEGER NOT NULL,
+    used_space INTEGER NOT NULL,
+    used_inodes INTEGER NOT NULL
+);
+";
+
+/// SQLite-backed [`Meta`] engine.
+#[derive(Debug, Clone)]
+pub struct SqliteMeta {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteMeta {
+    /// Opens or creates a SQLite metadata database at `path` (or `:memory:`).
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, MetaError> {
+        let path_ref = path.as_ref();
+        if path_ref != Path::new(":memory:")
+            && let Some(parent) = path_ref.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| MetaError::InvalidInput(format!("cannot create meta dir: {e}")))?;
+        }
+        let conn = Connection::open(path_ref)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        conn.execute_batch(SCHEMA_SQL)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    async fn run<F, R>(&self, f: F) -> Result<R, MetaError>
+    where
+        F: FnOnce(&mut Connection) -> Result<R, MetaError> + Send + 'static,
+        R: Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn.lock();
+            f(&mut guard)
+        })
+        .await
+        .map_err(|e| MetaError::Task(e.to_string()))?
+    }
+}
+
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64)
+}
+
+fn split_ns(ns: i64) -> (i64, i64) {
+    (ns / 1_000, ns % 1_000)
+}
+
+fn validate_name(name: &str) -> Result<(), MetaError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.len() > MAX_NAME
+    {
+        return Err(MetaError::InvalidInput(format!(
+            "invalid entry name: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn next_counter(tx: &Transaction<'_>, name: &str, delta: i64) -> Result<i64, MetaError> {
+    tx.execute(
+        "INSERT INTO jfs_counter (name, value) VALUES (?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET value = value + ?2",
+        params![name, delta],
+    )?;
+    let val: i64 = tx.query_row(
+        "SELECT value FROM jfs_counter WHERE name = ?1",
+        params![name],
+        |r| r.get(0),
+    )?;
+    Ok(val)
+}
+
+fn get_counter(conn: &Connection, name: &str) -> Result<i64, MetaError> {
+    let val: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM jfs_counter WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(val.unwrap_or(0))
+}
+
+fn read_attr(conn: &Connection, inode: Ino) -> Result<Attr, MetaError> {
+    conn.query_row(
+        "SELECT type, flags, mode, uid, gid, atime, mtime, ctime,
+                atimensec, mtimensec, ctimensec, nlink, length, rdev, parent, tier_id
+         FROM jfs_node WHERE inode = ?1",
+        params![inode.as_u64() as i64],
+        |row| {
+            let typ_raw: u8 = row.get(0)?;
+            let atime_us: i64 = row.get(5)?;
+            let mtime_us: i64 = row.get(6)?;
+            let ctime_us: i64 = row.get(7)?;
+            let atime_sub: i64 = row.get(8)?;
+            let mtime_sub: i64 = row.get(9)?;
+            let ctime_sub: i64 = row.get(10)?;
+            Ok((
+                typ_raw,
+                Attr {
+                    flags: row.get(1)?,
+                    typ: NodeType::File,
+                    mode: row.get(2)?,
+                    uid: row.get(3)?,
+                    gid: row.get(4)?,
+                    atime: atime_us / 1_000_000,
+                    mtime: mtime_us / 1_000_000,
+                    ctime: ctime_us / 1_000_000,
+                    atime_nsec: ((atime_us % 1_000_000) * 1_000 + atime_sub) as u32,
+                    mtime_nsec: ((mtime_us % 1_000_000) * 1_000 + mtime_sub) as u32,
+                    ctime_nsec: ((ctime_us % 1_000_000) * 1_000 + ctime_sub) as u32,
+                    nlink: row.get(11)?,
+                    length: row.get::<_, i64>(12)? as u64,
+                    rdev: row.get(13)?,
+                    parent: Ino(row.get::<_, i64>(14)? as u64),
+                    tier: row.get(15)?,
+                },
+            ))
+        },
+    )
+    .optional()?
+    .ok_or_else(|| MetaError::NotFound(format!("inode {inode}")))
+    .and_then(|(typ_raw, mut attr)| {
+        attr.typ = NodeType::try_from(typ_raw)?;
+        Ok(attr)
+    })
+}
+
+pub(crate) fn insert_node(tx: &Transaction<'_>, inode: Ino, attr: &Attr) -> Result<(), MetaError> {
+    let atime_us = attr.atime * 1_000_000 + i64::from(attr.atime_nsec) / 1_000;
+    let atime_sub = i64::from(attr.atime_nsec) % 1_000;
+    let mtime_us = attr.mtime * 1_000_000 + i64::from(attr.mtime_nsec) / 1_000;
+    let mtime_sub = i64::from(attr.mtime_nsec) % 1_000;
+    let ctime_us = attr.ctime * 1_000_000 + i64::from(attr.ctime_nsec) / 1_000;
+    let ctime_sub = i64::from(attr.ctime_nsec) % 1_000;
+
+    tx.execute(
+        "INSERT INTO jfs_node (
+            inode, type, flags, mode, uid, gid, atime, mtime, ctime,
+            atimensec, mtimensec, ctimensec, nlink, length, rdev, parent, tier_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        params![
+            inode.as_u64() as i64,
+            attr.typ as u8,
+            attr.flags,
+            attr.mode,
+            attr.uid,
+            attr.gid,
+            atime_us,
+            mtime_us,
+            ctime_us,
+            atime_sub,
+            mtime_sub,
+            ctime_sub,
+            attr.nlink,
+            attr.length as i64,
+            attr.rdev,
+            attr.parent.as_u64() as i64,
+            attr.tier,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_parent_mtime(tx: &Transaction<'_>, parent: Ino, ns: i64) -> Result<(), MetaError> {
+    let (us, sub) = split_ns(ns);
+    tx.execute(
+        "UPDATE jfs_node SET mtime = ?1, mtimensec = ?2, ctime = ?1, ctimensec = ?2 WHERE inode = ?3",
+        params![us, sub, parent.as_u64() as i64],
+    )?;
+    Ok(())
+}
+
+fn decrement_chunk_refs(tx: &Transaction<'_>, inode: Ino) -> Result<(), MetaError> {
+    let mut stmt = tx.prepare("SELECT slices FROM jfs_chunk WHERE inode = ?1")?;
+    let rows = stmt.query_map(params![inode.as_u64() as i64], |r| r.get::<_, Vec<u8>>(0))?;
+    let mut blobs = Vec::new();
+    for blob in rows {
+        blobs.push(blob?);
+    }
+    drop(stmt);
+
+    for blob in blobs {
+        for rec in decode_slices(&blob)? {
+            if rec.id > 0 {
+                tx.execute(
+                    "UPDATE jfs_slice_ref SET refs = refs - 1 WHERE id = ?1",
+                    params![rec.id as i64],
+                )?;
+            }
+        }
+    }
+    tx.execute(
+        "DELETE FROM jfs_chunk WHERE inode = ?1",
+        params![inode.as_u64() as i64],
+    )?;
+    Ok(())
+}
+
+fn delete_inode_auxiliary(tx: &Transaction<'_>, ino_raw: i64) -> Result<(), MetaError> {
+    tx.execute("DELETE FROM jfs_symlink WHERE inode = ?1", params![ino_raw])?;
+    tx.execute("DELETE FROM jfs_xattr WHERE inode = ?1", params![ino_raw])?;
+    tx.execute("DELETE FROM jfs_flock WHERE inode = ?1", params![ino_raw])?;
+    tx.execute("DELETE FROM jfs_plock WHERE inode = ?1", params![ino_raw])?;
+    tx.execute("DELETE FROM jfs_node WHERE inode = ?1", params![ino_raw])?;
+    Ok(())
+}
+
+fn calc_dir_descendant_usage(conn: &Connection, dir_ino: Ino) -> Result<(i64, i64), MetaError> {
+    let mut queue = vec![dir_ino];
+    let mut visited = HashSet::new();
+    visited.insert(dir_ino.as_u64());
+    let mut total_space: i64 = 0;
+    let mut total_inodes: i64 = 0;
+
+    while let Some(cur) = queue.pop() {
+        let mut stmt = conn.prepare("SELECT inode, type FROM jfs_edge WHERE parent = ?1")?;
+        let rows = stmt.query_map(params![cur.as_u64() as i64], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, u8>(1)?))
+        })?;
+        let mut children = Vec::new();
+        for row in rows {
+            children.push(row?);
+        }
+        drop(stmt);
+
+        for (child_u64, typ_raw) in children {
+            total_inodes += 1;
+            let typ = NodeType::try_from(typ_raw)?;
+            if typ == NodeType::Directory {
+                if visited.insert(child_u64) {
+                    queue.push(Ino(child_u64));
+                }
+            } else if typ == NodeType::File {
+                let len: Option<i64> = conn
+                    .query_row(
+                        "SELECT length FROM jfs_node WHERE inode = ?1",
+                        params![child_u64 as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                total_space += len.unwrap_or(0);
+            }
+        }
+    }
+
+    Ok((total_space, total_inodes))
+}
+
+fn ancestor_quota_inodes(
+    conn: &Connection,
+    start_dir: Ino,
+) -> Result<Vec<(Ino, Quota)>, MetaError> {
+    let mut result = Vec::new();
+    let mut visited = HashSet::new();
+    let mut cur = start_dir;
+
+    while cur.is_valid() && !cur.is_trash() && visited.insert(cur.as_u64()) {
+        if let Some(q) = conn
+            .query_row(
+                "SELECT max_space, max_inodes, used_space, used_inodes FROM jfs_dir_quota WHERE inode = ?1",
+                params![cur.as_u64() as i64],
+                |r| {
+                    Ok(Quota {
+                        max_space: r.get(0)?,
+                        max_inodes: r.get(1)?,
+                        used_space: r.get(2)?,
+                        used_inodes: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?
+        {
+            result.push((cur, q));
+        }
+        if cur == ROOT_INODE {
+            break;
+        }
+        let parent_opt: Option<i64> = conn
+            .query_row(
+                "SELECT parent FROM jfs_node WHERE inode = ?1",
+                params![cur.as_u64() as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(parent_raw) = parent_opt else {
+            break;
+        };
+        let parent = Ino(parent_raw as u64);
+        if parent == cur || !parent.is_valid() {
+            break;
+        }
+        cur = parent;
+    }
+
+    Ok(result)
+}
+
+fn apply_quota_delta_dirs(
+    tx: &Transaction<'_>,
+    dirs: &[Ino],
+    delta_space: i64,
+    delta_inodes: i64,
+) -> Result<(), MetaError> {
+    if delta_space == 0 && delta_inodes == 0 {
+        return Ok(());
+    }
+    let mut quotas_by_ino: BTreeMap<u64, Quota> = BTreeMap::new();
+    for &dir in dirs {
+        for (q_ino, q) in ancestor_quota_inodes(tx, dir)? {
+            quotas_by_ino.insert(q_ino.as_u64(), q);
+        }
+    }
+    if quotas_by_ino.is_empty() {
+        return Ok(());
+    }
+
+    for (q_ino, q) in &quotas_by_ino {
+        if delta_space > 0 && q.max_space > 0 && q.used_space + delta_space > q.max_space {
+            return Err(MetaError::QuotaExceeded(format!(
+                "directory inode {q_ino} space quota exceeded ({} + {} > {})",
+                q.used_space, delta_space, q.max_space
+            )));
+        }
+        if delta_inodes > 0 && q.max_inodes > 0 && q.used_inodes + delta_inodes > q.max_inodes {
+            return Err(MetaError::QuotaExceeded(format!(
+                "directory inode {q_ino} inode quota exceeded ({} + {} > {})",
+                q.used_inodes, delta_inodes, q.max_inodes
+            )));
+        }
+    }
+
+    for (q_ino, q) in quotas_by_ino {
+        let new_space = (q.used_space + delta_space).max(0);
+        let new_inodes = (q.used_inodes + delta_inodes).max(0);
+        tx.execute(
+            "UPDATE jfs_dir_quota SET used_space = ?1, used_inodes = ?2 WHERE inode = ?3",
+            params![new_space, new_inodes, q_ino as i64],
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_quota_delta(
+    tx: &Transaction<'_>,
+    dir: Ino,
+    delta_space: i64,
+    delta_inodes: i64,
+) -> Result<(), MetaError> {
+    apply_quota_delta_dirs(tx, &[dir], delta_space, delta_inodes)
+}
+
+fn file_parent_dirs(conn: &Connection, inode: Ino, attr: &Attr) -> Result<Vec<Ino>, MetaError> {
+    if attr.parent.is_valid() {
+        return Ok(vec![attr.parent]);
+    }
+    let mut stmt = conn.prepare("SELECT DISTINCT parent FROM jfs_edge WHERE inode = ?1")?;
+    let rows = stmt.query_map(params![inode.as_u64() as i64], |r| r.get::<_, i64>(0))?;
+    let mut dirs = Vec::new();
+    for row in rows {
+        dirs.push(Ino(row? as u64));
+    }
+    Ok(dirs)
+}
+
+fn encode_plocks(records: &[PlockRecord]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(records.len() * 24);
+    for rec in records {
+        out.extend_from_slice(&u32::from(rec.typ as u8).to_be_bytes());
+        out.extend_from_slice(&rec.pid.to_be_bytes());
+        out.extend_from_slice(&rec.start.to_be_bytes());
+        out.extend_from_slice(&rec.end.to_be_bytes());
+    }
+    out
+}
+
+fn decode_plocks(bytes: &[u8]) -> Result<Vec<PlockRecord>, MetaError> {
+    let (chunks, rem) = bytes.as_chunks::<24>();
+    if !rem.is_empty() {
+        return Err(MetaError::InvalidInput(format!(
+            "corrupt plock record length: {}",
+            bytes.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let typ_raw = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let typ = FlockType::try_from(
+            u8::try_from(typ_raw)
+                .map_err(|_| MetaError::InvalidInput(format!("invalid plock type: {typ_raw}")))?,
+        )?;
+        let pid = u32::from_be_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        let start = u64::from_be_bytes([
+            chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],
+        ]);
+        let end = u64::from_be_bytes([
+            chunk[16], chunk[17], chunk[18], chunk[19], chunk[20], chunk[21], chunk[22], chunk[23],
+        ]);
+        out.push(PlockRecord {
+            typ,
+            pid,
+            start,
+            end,
+        });
+    }
+    Ok(out)
+}
+
+fn update_plocks(mut ls: Vec<PlockRecord>, nl: PlockRecord) -> Vec<PlockRecord> {
+    if nl.start > nl.end {
+        return ls;
+    }
+    let mut rem = Some(nl);
+    let orig_len = ls.len();
+    for i in 0..orig_len {
+        let Some(mut cur_nl) = rem else {
+            break;
+        };
+        let mut l = ls[i];
+        if cur_nl.start < l.start && cur_nl.end >= l.start {
+            let mut prefix = cur_nl;
+            prefix.end = l.start - 1;
+            ls.push(prefix);
+            cur_nl.start = l.start;
+        }
+        if cur_nl.start > l.start && cur_nl.start <= l.end {
+            let mut before = l;
+            before.end = cur_nl.start - 1;
+            ls.push(before);
+            ls[i].start = cur_nl.start;
+            l.start = cur_nl.start;
+        }
+        if cur_nl.start == l.start {
+            ls[i].typ = cur_nl.typ;
+            ls[i].pid = cur_nl.pid;
+            if l.end > cur_nl.end {
+                let mut after = l;
+                after.start = cur_nl.end + 1;
+                ls[i].end = cur_nl.end;
+                ls.push(after);
+            }
+            rem = ls[i]
+                .end
+                .checked_add(1)
+                .filter(|&s| s <= cur_nl.end)
+                .map(|s| {
+                    cur_nl.start = s;
+                    cur_nl
+                });
+        } else {
+            rem = Some(cur_nl);
+        }
+    }
+    if let Some(tail) = rem
+        && tail.start <= tail.end
+    {
+        ls.push(tail);
+    }
+
+    ls.sort_by_key(|r| r.start);
+    ls.retain(|r| r.typ != FlockType::Unlock && r.start <= r.end);
+
+    let mut merged: Vec<PlockRecord> = Vec::with_capacity(ls.len());
+    for rec in ls {
+        if let Some(last) = merged.last_mut()
+            && last.typ == rec.typ
+            && last.pid == rec.pid
+            && last.end.checked_add(1) == Some(rec.start)
+        {
+            last.end = rec.end;
+        } else {
+            merged.push(rec);
+        }
+    }
+    merged
+}
+
+fn ensure_trash_node(tx: &Transaction<'_>, now: i64) -> Result<(), MetaError> {
+    let exists: Option<i64> = tx
+        .query_row(
+            "SELECT inode FROM jfs_node WHERE inode = ?1",
+            params![TRASH_INODE.as_u64() as i64],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        let sec = now / 1_000_000_000;
+        let nsec = (now % 1_000_000_000) as u32;
+        let trash_attr = Attr {
+            typ: NodeType::Directory,
+            mode: 0o555,
+            nlink: 2,
+            atime: sec,
+            mtime: sec,
+            ctime: sec,
+            atime_nsec: nsec,
+            mtime_nsec: nsec,
+            ctime_nsec: nsec,
+            parent: ROOT_INODE,
+            ..Attr::default()
+        };
+        insert_node(tx, TRASH_INODE, &trash_attr)?;
+    }
+    Ok(())
+}
+
+fn make_trash_entry_name(parent: Ino, inode: Ino, name: &str) -> String {
+    let full = format!("{}-{}-{name}", parent.as_u64(), inode.as_u64());
+    if full.len() <= MAX_NAME {
+        return full;
+    }
+    let mut end = MAX_NAME;
+    while !full.is_char_boundary(end) {
+        end -= 1;
+    }
+    full[..end].to_owned()
+}
+
+fn parse_trash_entry_name(trash_name: &str) -> Result<(Ino, Ino, &str), MetaError> {
+    let mut parts = trash_name.splitn(3, '-');
+    let parent_str = parts
+        .next()
+        .ok_or_else(|| MetaError::InvalidInput(format!("invalid trash entry: {trash_name}")))?;
+    let ino_str = parts
+        .next()
+        .ok_or_else(|| MetaError::InvalidInput(format!("invalid trash entry: {trash_name}")))?;
+    let orig_name = parts
+        .next()
+        .ok_or_else(|| MetaError::InvalidInput(format!("invalid trash entry: {trash_name}")))?;
+    let orig_parent: u64 = parent_str
+        .parse()
+        .map_err(|_| MetaError::InvalidInput(format!("invalid trash parent in: {trash_name}")))?;
+    let orig_ino: u64 = ino_str
+        .parse()
+        .map_err(|_| MetaError::InvalidInput(format!("invalid trash inode in: {trash_name}")))?;
+    validate_name(orig_name)?;
+    Ok((Ino(orig_parent), Ino(orig_ino), orig_name))
+}
+
+fn load_format_sync(conn: &Connection) -> Result<Format, MetaError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM jfs_setting WHERE name = 'format'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let json = raw.ok_or(MetaError::NotFormatted)?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+fn purge_trash_dir_recursive(tx: &Transaction<'_>, dir_ino: Ino) -> Result<u64, MetaError> {
+    let mut stmt = tx.prepare("SELECT name, inode, type FROM jfs_edge WHERE parent = ?1")?;
+    let rows = stmt.query_map(params![dir_ino.as_u64() as i64], |r| {
+        Ok((
+            r.get::<_, Vec<u8>>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, u8>(2)?,
+        ))
+    })?;
+    let mut children = Vec::new();
+    for row in rows {
+        children.push(row?);
+    }
+    drop(stmt);
+
+    let mut deleted: u64 = 0;
+    for (name_bytes, child_raw, typ_raw) in children {
+        let child_ino = Ino(child_raw as u64);
+        let typ = NodeType::try_from(typ_raw)?;
+        if typ == NodeType::Directory {
+            deleted += purge_trash_dir_recursive(tx, child_ino)?;
+            tx.execute(
+                "DELETE FROM jfs_dir_quota WHERE inode = ?1",
+                params![child_raw],
+            )?;
+            delete_inode_auxiliary(tx, child_raw)?;
+            let _ = next_counter(tx, "usedInodes", -1)?;
+            deleted += 1;
+        } else {
+            let attr = read_attr(tx, child_ino)?;
+            if attr.nlink <= 1 {
+                decrement_chunk_refs(tx, child_ino)?;
+                delete_inode_auxiliary(tx, child_raw)?;
+                let _ = next_counter(tx, "usedInodes", -1)?;
+                let _ = next_counter(tx, "usedSpace", -(attr.length as i64))?;
+                deleted += 1;
+            } else {
+                tx.execute(
+                    "UPDATE jfs_node SET nlink = nlink - 1 WHERE inode = ?1",
+                    params![child_raw],
+                )?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+            params![dir_ino.as_u64() as i64, name_bytes],
+        )?;
+    }
+    Ok(deleted)
+}
+
+fn remove_existing_dst(
+    tx: &Transaction<'_>,
+    dst_parent: Ino,
+    dst_name: &str,
+) -> Result<(), MetaError> {
+    let dst_row: Option<(i64, u8)> = tx
+        .query_row(
+            "SELECT inode, type FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+            params![dst_parent.as_u64() as i64, dst_name.as_bytes()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+
+    let Some((dst_ino_raw, dst_typ)) = dst_row else {
+        return Ok(());
+    };
+    if NodeType::try_from(dst_typ)? == NodeType::Directory {
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(1) FROM jfs_edge WHERE parent = ?1",
+            params![dst_ino_raw],
+            |r| r.get(0),
+        )?;
+        if count > 0 {
+            return Err(MetaError::NotEmpty(dst_name.to_owned()));
+        }
+        apply_quota_delta(tx, dst_parent, 0, -1)?;
+        tx.execute(
+            "DELETE FROM jfs_dir_quota WHERE inode = ?1",
+            params![dst_ino_raw],
+        )?;
+        delete_inode_auxiliary(tx, dst_ino_raw)?;
+        tx.execute(
+            "UPDATE jfs_node SET nlink = MAX(2, nlink - 1) WHERE inode = ?1",
+            params![dst_parent.as_u64() as i64],
+        )?;
+        let _ = next_counter(tx, "usedInodes", -1)?;
+    } else {
+        let dst_ino = Ino(dst_ino_raw as u64);
+        let dst_attr = read_attr(tx, dst_ino)?;
+        apply_quota_delta(tx, dst_parent, -(dst_attr.length as i64), -1)?;
+        if dst_attr.nlink <= 1 {
+            decrement_chunk_refs(tx, dst_ino)?;
+            delete_inode_auxiliary(tx, dst_ino_raw)?;
+            let _ = next_counter(tx, "usedInodes", -1)?;
+            let _ = next_counter(tx, "usedSpace", -(dst_attr.length as i64))?;
+        } else {
+            tx.execute(
+                "UPDATE jfs_node SET nlink = nlink - 1 WHERE inode = ?1",
+                params![dst_ino_raw],
+            )?;
+        }
+    }
+    tx.execute(
+        "DELETE FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+        params![dst_parent.as_u64() as i64, dst_name.as_bytes()],
+    )?;
+    Ok(())
+}
+
+#[async_trait]
+impl Meta for SqliteMeta {
+    async fn init(&self, format: &Format, force: bool) -> Result<(), MetaError> {
+        let format_json = serde_json::to_string(format)?;
+        let create_trash = format.trash_days > 0;
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM jfs_setting WHERE name = 'format'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if existing.is_some() && !force {
+                return Err(MetaError::AlreadyExists("volume already formatted".to_owned()));
+            }
+            if force {
+                tx.execute_batch(
+                    "DELETE FROM jfs_setting;
+                     DELETE FROM jfs_counter;
+                     DELETE FROM jfs_edge;
+                     DELETE FROM jfs_node;
+                     DELETE FROM jfs_chunk;
+                     DELETE FROM jfs_slice_ref;
+                     DELETE FROM jfs_symlink;
+                     DELETE FROM jfs_xattr;
+                     DELETE FROM jfs_flock;
+                     DELETE FROM jfs_plock;
+                     DELETE FROM jfs_dir_quota;",
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO jfs_setting (name, value) VALUES ('format', ?1)",
+                params![format_json],
+            )?;
+            tx.execute(
+                "INSERT INTO jfs_counter (name, value) VALUES ('nextInode', 1), ('nextChunk', 0), ('usedSpace', 0), ('usedInodes', 1)",
+                [],
+            )?;
+            let now = now_ns();
+            let sec = now / 1_000_000_000;
+            let nsec = (now % 1_000_000_000) as u32;
+            let root = Attr {
+                typ: NodeType::Directory,
+                mode: 0o777,
+                nlink: 2,
+                atime: sec,
+                mtime: sec,
+                ctime: sec,
+                atime_nsec: nsec,
+                mtime_nsec: nsec,
+                ctime_nsec: nsec,
+                parent: ROOT_INODE,
+                ..Attr::default()
+            };
+            insert_node(&tx, ROOT_INODE, &root)?;
+            if create_trash {
+                ensure_trash_node(&tx, now)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn load(&self) -> Result<Format, MetaError> {
+        self.run(|conn| {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM jfs_setting WHERE name = 'format'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let json = raw.ok_or(MetaError::NotFormatted)?;
+            Ok(serde_json::from_str(&json)?)
+        })
+        .await
+    }
+
+    async fn statfs(&self) -> Result<StatFs, MetaError> {
+        self.run(|conn| {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM jfs_setting WHERE name = 'format'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let fmt: Format = serde_json::from_str(&raw.ok_or(MetaError::NotFormatted)?)?;
+            let used_space = get_counter(conn, "usedSpace")?.max(0) as u64;
+            let used_inodes = get_counter(conn, "usedInodes")?.max(0) as u64;
+            let total_space = if fmt.capacity > 0 {
+                fmt.capacity
+            } else {
+                1u64 << 50
+            };
+            let avail_space = total_space.saturating_sub(used_space);
+            let total_inodes = if fmt.inodes > 0 {
+                fmt.inodes
+            } else {
+                10_000_000
+            };
+            let avail_inodes = total_inodes.saturating_sub(used_inodes);
+            Ok(StatFs {
+                total_space,
+                avail_space,
+                used_inodes,
+                avail_inodes,
+            })
+        })
+        .await
+    }
+
+    async fn lookup(&self, parent: Ino, name: &str) -> Result<(Ino, Attr), MetaError> {
+        if name == "." {
+            let attr = self.getattr(parent).await?;
+            return Ok((parent, attr));
+        }
+        let name = name.to_owned();
+        self.run(move |conn| {
+            if name == ".." {
+                let pattr = read_attr(conn, parent)?;
+                let target = if pattr.parent.is_valid() {
+                    pattr.parent
+                } else {
+                    ROOT_INODE
+                };
+                let tattr = read_attr(conn, target)?;
+                return Ok((target, tattr));
+            }
+            if parent == ROOT_INODE
+                && name == ".trash"
+                && let Ok(tattr) = read_attr(conn, TRASH_INODE)
+            {
+                return Ok((TRASH_INODE, tattr));
+            }
+            let inode_opt: Option<i64> = conn
+                .query_row(
+                    "SELECT inode FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![parent.as_u64() as i64, name.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let ino = inode_opt
+                .map(|v| Ino(v as u64))
+                .ok_or_else(|| MetaError::NotFound(name.clone()))?;
+            let attr = read_attr(conn, ino)?;
+            Ok((ino, attr))
+        })
+        .await
+    }
+
+    async fn getattr(&self, inode: Ino) -> Result<Attr, MetaError> {
+        self.run(move |conn| read_attr(conn, inode)).await
+    }
+
+    async fn setattr(
+        &self,
+        inode: Ino,
+        attr: &Attr,
+        mask: SetAttrFlags,
+    ) -> Result<Attr, MetaError> {
+        let attr = attr.clone();
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let mut cur = read_attr(&tx, inode)?;
+            let now = now_ns();
+            let sec_now = now / 1_000_000_000;
+            let nsec_now = (now % 1_000_000_000) as u32;
+
+            if mask.contains(SetAttrFlags::MODE) {
+                cur.mode = attr.mode;
+            }
+            if mask.contains(SetAttrFlags::UID) {
+                cur.uid = attr.uid;
+            }
+            if mask.contains(SetAttrFlags::GID) {
+                cur.gid = attr.gid;
+            }
+            if mask.contains(SetAttrFlags::ATIME_NOW) {
+                cur.atime = sec_now;
+                cur.atime_nsec = nsec_now;
+            } else if mask.contains(SetAttrFlags::ATIME) {
+                cur.atime = attr.atime;
+                cur.atime_nsec = attr.atime_nsec;
+            }
+            if mask.contains(SetAttrFlags::MTIME_NOW) {
+                cur.mtime = sec_now;
+                cur.mtime_nsec = nsec_now;
+            } else if mask.contains(SetAttrFlags::MTIME) {
+                cur.mtime = attr.mtime;
+                cur.mtime_nsec = attr.mtime_nsec;
+            }
+            if mask.contains(SetAttrFlags::CTIME_NOW) {
+                cur.ctime = sec_now;
+                cur.ctime_nsec = nsec_now;
+            } else if mask.contains(SetAttrFlags::CTIME) {
+                cur.ctime = attr.ctime;
+                cur.ctime_nsec = attr.ctime_nsec;
+            } else {
+                cur.ctime = sec_now;
+                cur.ctime_nsec = nsec_now;
+            }
+
+            let atime_us = cur.atime * 1_000_000 + i64::from(cur.atime_nsec) / 1_000;
+            let mtime_us = cur.mtime * 1_000_000 + i64::from(cur.mtime_nsec) / 1_000;
+            let ctime_us = cur.ctime * 1_000_000 + i64::from(cur.ctime_nsec) / 1_000;
+
+            tx.execute(
+                "UPDATE jfs_node SET mode = ?1, uid = ?2, gid = ?3,
+                 atime = ?4, atimensec = ?5, mtime = ?6, mtimensec = ?7, ctime = ?8, ctimensec = ?9
+                 WHERE inode = ?10",
+                params![
+                    cur.mode,
+                    cur.uid,
+                    cur.gid,
+                    atime_us,
+                    i64::from(cur.atime_nsec) % 1_000,
+                    mtime_us,
+                    i64::from(cur.mtime_nsec) % 1_000,
+                    ctime_us,
+                    i64::from(cur.ctime_nsec) % 1_000,
+                    inode.as_u64() as i64,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(cur)
+        })
+        .await
+    }
+
+    async fn mknod(
+        &self,
+        parent: Ino,
+        name: &str,
+        typ: NodeType,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(Ino, Attr), MetaError> {
+        validate_name(name)?;
+        if typ == NodeType::Directory {
+            return self.mkdir(parent, name, mode, uid, gid).await;
+        }
+        let name = name.to_owned();
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let pattr = read_attr(&tx, parent)?;
+            if !pattr.is_dir() {
+                return Err(MetaError::NotDir(format!("inode {parent}")));
+            }
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT inode FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![parent.as_u64() as i64, name.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                return Err(MetaError::AlreadyExists(name));
+            }
+            apply_quota_delta(&tx, parent, 0, 1)?;
+            let ino = Ino(next_counter(&tx, "nextInode", 1)? as u64);
+            let _ = next_counter(&tx, "usedInodes", 1)?;
+            let now = now_ns();
+            let sec = now / 1_000_000_000;
+            let nsec = (now % 1_000_000_000) as u32;
+            let attr = Attr {
+                typ,
+                mode,
+                uid,
+                gid,
+                nlink: 1,
+                atime: sec,
+                mtime: sec,
+                ctime: sec,
+                atime_nsec: nsec,
+                mtime_nsec: nsec,
+                ctime_nsec: nsec,
+                parent,
+                ..Attr::default()
+            };
+            insert_node(&tx, ino, &attr)?;
+            tx.execute(
+                "INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    parent.as_u64() as i64,
+                    name.as_bytes(),
+                    ino.as_u64() as i64,
+                    typ as u8
+                ],
+            )?;
+            update_parent_mtime(&tx, parent, now)?;
+            tx.commit()?;
+            Ok((ino, attr))
+        })
+        .await
+    }
+
+    async fn mkdir(
+        &self,
+        parent: Ino,
+        name: &str,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(Ino, Attr), MetaError> {
+        validate_name(name)?;
+        let name = name.to_owned();
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let pattr = read_attr(&tx, parent)?;
+            if !pattr.is_dir() {
+                return Err(MetaError::NotDir(format!("inode {parent}")));
+            }
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT inode FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![parent.as_u64() as i64, name.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                return Err(MetaError::AlreadyExists(name));
+            }
+            apply_quota_delta(&tx, parent, 0, 1)?;
+            let ino = Ino(next_counter(&tx, "nextInode", 1)? as u64);
+            let _ = next_counter(&tx, "usedInodes", 1)?;
+            let now = now_ns();
+            let sec = now / 1_000_000_000;
+            let nsec = (now % 1_000_000_000) as u32;
+            let attr = Attr {
+                typ: NodeType::Directory,
+                mode,
+                uid,
+                gid,
+                nlink: 2,
+                atime: sec,
+                mtime: sec,
+                ctime: sec,
+                atime_nsec: nsec,
+                mtime_nsec: nsec,
+                ctime_nsec: nsec,
+                parent,
+                ..Attr::default()
+            };
+            insert_node(&tx, ino, &attr)?;
+            tx.execute(
+                "INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    parent.as_u64() as i64,
+                    name.as_bytes(),
+                    ino.as_u64() as i64,
+                    NodeType::Directory as u8
+                ],
+            )?;
+            tx.execute(
+                "UPDATE jfs_node SET nlink = nlink + 1 WHERE inode = ?1",
+                params![parent.as_u64() as i64],
+            )?;
+            update_parent_mtime(&tx, parent, now)?;
+            tx.commit()?;
+            Ok((ino, attr))
+        })
+        .await
+    }
+
+    async fn symlink(
+        &self,
+        parent: Ino,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(Ino, Attr), MetaError> {
+        validate_name(name)?;
+        if target.is_empty() || target.len() > MAX_SYMLINK {
+            return Err(MetaError::InvalidInput("invalid symlink target".to_owned()));
+        }
+        let name = name.to_owned();
+        let target = target.to_owned();
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let pattr = read_attr(&tx, parent)?;
+            if !pattr.is_dir() {
+                return Err(MetaError::NotDir(format!("inode {parent}")));
+            }
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT inode FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![parent.as_u64() as i64, name.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                return Err(MetaError::AlreadyExists(name));
+            }
+            apply_quota_delta(&tx, parent, 0, 1)?;
+            let ino = Ino(next_counter(&tx, "nextInode", 1)? as u64);
+            let _ = next_counter(&tx, "usedInodes", 1)?;
+            let now = now_ns();
+            let sec = now / 1_000_000_000;
+            let nsec = (now % 1_000_000_000) as u32;
+            let attr = Attr {
+                typ: NodeType::Symlink,
+                mode: 0o777,
+                uid,
+                gid,
+                nlink: 1,
+                length: target.len() as u64,
+                atime: sec,
+                mtime: sec,
+                ctime: sec,
+                atime_nsec: nsec,
+                mtime_nsec: nsec,
+                ctime_nsec: nsec,
+                parent,
+                ..Attr::default()
+            };
+            insert_node(&tx, ino, &attr)?;
+            tx.execute(
+                "INSERT INTO jfs_symlink (inode, target) VALUES (?1, ?2)",
+                params![ino.as_u64() as i64, target.as_bytes()],
+            )?;
+            tx.execute(
+                "INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    parent.as_u64() as i64,
+                    name.as_bytes(),
+                    ino.as_u64() as i64,
+                    NodeType::Symlink as u8
+                ],
+            )?;
+            update_parent_mtime(&tx, parent, now)?;
+            tx.commit()?;
+            Ok((ino, attr))
+        })
+        .await
+    }
+
+    async fn readlink(&self, inode: Ino) -> Result<String, MetaError> {
+        self.run(move |conn| {
+            let target: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT target FROM jfs_symlink WHERE inode = ?1",
+                    params![inode.as_u64() as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let bytes = target.ok_or_else(|| MetaError::NotFound(format!("symlink {inode}")))?;
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .await
+    }
+
+    async fn link(&self, inode: Ino, new_parent: Ino, new_name: &str) -> Result<Attr, MetaError> {
+        validate_name(new_name)?;
+        let new_name = new_name.to_owned();
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let pattr = read_attr(&tx, new_parent)?;
+            if !pattr.is_dir() {
+                return Err(MetaError::NotDir(format!("inode {new_parent}")));
+            }
+            let mut attr = read_attr(&tx, inode)?;
+            if attr.is_dir() {
+                return Err(MetaError::IsDir(format!("inode {inode}")));
+            }
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT inode FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![new_parent.as_u64() as i64, new_name.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                return Err(MetaError::AlreadyExists(new_name));
+            }
+            tx.execute(
+                "INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    new_parent.as_u64() as i64,
+                    new_name.as_bytes(),
+                    inode.as_u64() as i64,
+                    attr.typ as u8
+                ],
+            )?;
+            apply_quota_delta(&tx, new_parent, attr.length as i64, 1)?;
+            attr.nlink += 1;
+            let now = now_ns();
+            let (us, sub) = split_ns(now);
+            tx.execute(
+                "UPDATE jfs_node SET nlink = nlink + 1, ctime = ?1, ctimensec = ?2, parent = 0 WHERE inode = ?3",
+                params![us, sub, inode.as_u64() as i64],
+            )?;
+            update_parent_mtime(&tx, new_parent, now)?;
+            tx.commit()?;
+            Ok(attr)
+        })
+        .await
+    }
+
+    async fn unlink(&self, parent: Ino, name: &str) -> Result<(), MetaError> {
+        validate_name(name)?;
+        let name = name.to_owned();
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let row: Option<(i64, u8)> = tx
+                .query_row(
+                    "SELECT inode, type FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![parent.as_u64() as i64, name.as_bytes()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let (ino_raw, typ_raw) = row.ok_or_else(|| MetaError::NotFound(name.clone()))?;
+            let ino = Ino(ino_raw as u64);
+            if NodeType::try_from(typ_raw)? == NodeType::Directory {
+                return Err(MetaError::IsDir(name));
+            }
+            tx.execute(
+                "DELETE FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                params![parent.as_u64() as i64, name.as_bytes()],
+            )?;
+            let attr = read_attr(&tx, ino)?;
+            apply_quota_delta(&tx, parent, -(attr.length as i64), -1)?;
+            let now = now_ns();
+            if attr.nlink <= 1 {
+                decrement_chunk_refs(&tx, ino)?;
+                delete_inode_auxiliary(&tx, ino_raw)?;
+                let _ = next_counter(&tx, "usedInodes", -1)?;
+                let _ = next_counter(&tx, "usedSpace", -(attr.length as i64))?;
+            } else {
+                let (us, sub) = split_ns(now);
+                tx.execute(
+                    "UPDATE jfs_node SET nlink = nlink - 1, ctime = ?1, ctimensec = ?2 WHERE inode = ?3",
+                    params![us, sub, ino_raw],
+                )?;
+            }
+            update_parent_mtime(&tx, parent, now)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn rmdir(&self, parent: Ino, name: &str) -> Result<(), MetaError> {
+        validate_name(name)?;
+        let name = name.to_owned();
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let row: Option<(i64, u8)> = tx
+                .query_row(
+                    "SELECT inode, type FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![parent.as_u64() as i64, name.as_bytes()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let (ino_raw, typ_raw) = row.ok_or_else(|| MetaError::NotFound(name.clone()))?;
+            if NodeType::try_from(typ_raw)? != NodeType::Directory {
+                return Err(MetaError::NotDir(name));
+            }
+            let child_count: i64 = tx.query_row(
+                "SELECT COUNT(1) FROM jfs_edge WHERE parent = ?1",
+                params![ino_raw],
+                |r| r.get(0),
+            )?;
+            if child_count > 0 {
+                return Err(MetaError::NotEmpty(name));
+            }
+            tx.execute(
+                "DELETE FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                params![parent.as_u64() as i64, name.as_bytes()],
+            )?;
+            apply_quota_delta(&tx, parent, 0, -1)?;
+            tx.execute(
+                "DELETE FROM jfs_dir_quota WHERE inode = ?1",
+                params![ino_raw],
+            )?;
+            delete_inode_auxiliary(&tx, ino_raw)?;
+            tx.execute(
+                "UPDATE jfs_node SET nlink = MAX(2, nlink - 1) WHERE inode = ?1",
+                params![parent.as_u64() as i64],
+            )?;
+            let _ = next_counter(&tx, "usedInodes", -1)?;
+            update_parent_mtime(&tx, parent, now_ns())?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn rename(
+        &self,
+        src_parent: Ino,
+        src_name: &str,
+        dst_parent: Ino,
+        dst_name: &str,
+    ) -> Result<(), MetaError> {
+        validate_name(src_name)?;
+        validate_name(dst_name)?;
+        let src_name = src_name.to_owned();
+        let dst_name = dst_name.to_owned();
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let src_row: Option<(i64, u8)> = tx
+                .query_row(
+                    "SELECT inode, type FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![src_parent.as_u64() as i64, src_name.as_bytes()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let (src_ino_raw, src_typ) =
+                src_row.ok_or_else(|| MetaError::NotFound(src_name.clone()))?;
+            let dst_parent_attr = read_attr(&tx, dst_parent)?;
+            if !dst_parent_attr.is_dir() {
+                return Err(MetaError::NotDir(format!("inode {dst_parent}")));
+            }
+
+            if src_parent == dst_parent && src_name == dst_name {
+                return Ok(());
+            }
+
+            remove_existing_dst(&tx, dst_parent, &dst_name)?;
+
+            let is_dir = NodeType::try_from(src_typ)? == NodeType::Directory;
+            if src_parent != dst_parent {
+                let src_ino = Ino(src_ino_raw as u64);
+                let (moved_space, moved_inodes) = if is_dir {
+                    let (s, i) = calc_dir_descendant_usage(&tx, src_ino)?;
+                    (s, i + 1)
+                } else {
+                    let src_attr = read_attr(&tx, src_ino)?;
+                    (src_attr.length as i64, 1)
+                };
+                apply_quota_delta(&tx, src_parent, -moved_space, -moved_inodes)?;
+                apply_quota_delta(&tx, dst_parent, moved_space, moved_inodes)?;
+            }
+
+            tx.execute(
+                "DELETE FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                params![src_parent.as_u64() as i64, src_name.as_bytes()],
+            )?;
+            tx.execute(
+                "INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    dst_parent.as_u64() as i64,
+                    dst_name.as_bytes(),
+                    src_ino_raw,
+                    src_typ
+                ],
+            )?;
+            if is_dir && src_parent != dst_parent {
+                tx.execute(
+                    "UPDATE jfs_node SET nlink = MAX(2, nlink - 1) WHERE inode = ?1",
+                    params![src_parent.as_u64() as i64],
+                )?;
+                tx.execute(
+                    "UPDATE jfs_node SET nlink = nlink + 1 WHERE inode = ?1",
+                    params![dst_parent.as_u64() as i64],
+                )?;
+            }
+            tx.execute(
+                "UPDATE jfs_node SET parent = ?1 WHERE inode = ?2 AND parent != 0",
+                params![dst_parent.as_u64() as i64, src_ino_raw],
+            )?;
+            let now = now_ns();
+            update_parent_mtime(&tx, src_parent, now)?;
+            if dst_parent != src_parent {
+                update_parent_mtime(&tx, dst_parent, now)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn readdir(&self, inode: Ino) -> Result<Vec<Entry>, MetaError> {
+        self.run(move |conn| {
+            let dir_attr = read_attr(conn, inode)?;
+            if !dir_attr.is_dir() {
+                return Err(MetaError::NotDir(format!("inode {inode}")));
+            }
+            let mut stmt = conn.prepare(
+                "SELECT e.name, e.inode FROM jfs_edge e WHERE e.parent = ?1 ORDER BY e.name",
+            )?;
+            let rows = stmt.query_map(params![inode.as_u64() as i64], |r| {
+                let name_bytes: Vec<u8> = r.get(0)?;
+                let child_ino: i64 = r.get(1)?;
+                Ok((
+                    String::from_utf8_lossy(&name_bytes).into_owned(),
+                    Ino(child_ino as u64),
+                ))
+            })?;
+            let mut pairs = Vec::new();
+            for row in rows {
+                pairs.push(row?);
+            }
+            drop(stmt);
+
+            let mut entries = Vec::with_capacity(pairs.len());
+            for (name, child_ino) in pairs {
+                let attr = read_attr(conn, child_ino)?;
+                entries.push(Entry {
+                    inode: child_ino,
+                    name,
+                    attr,
+                });
+            }
+            Ok(entries)
+        })
+        .await
+    }
+
+    async fn new_slice(&self) -> Result<u64, MetaError> {
+        self.run(|conn| {
+            let tx = conn.transaction()?;
+            let id = next_counter(&tx, "nextChunk", 1)?;
+            tx.commit()?;
+            Ok(id as u64)
+        })
+        .await
+    }
+
+    async fn read_chunk(&self, inode: Ino, indx: u32) -> Result<Vec<Slice>, MetaError> {
+        self.run(move |conn| {
+            let blob: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT slices FROM jfs_chunk WHERE inode = ?1 AND indx = ?2",
+                    params![inode.as_u64() as i64, i64::from(indx)],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(bytes) = blob else {
+                return Ok(Vec::new());
+            };
+            let records = decode_slices(&bytes)?;
+            Ok(build_slice(&records))
+        })
+        .await
+    }
+
+    async fn write_chunk(
+        &self,
+        inode: Ino,
+        indx: u32,
+        pos: u32,
+        slice: Slice,
+        new_file_length: u64,
+    ) -> Result<Attr, MetaError> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let mut attr = read_attr(&tx, inode)?;
+            if !attr.is_file() {
+                return Err(MetaError::IsDir(format!("inode {inode}")));
+            }
+            let encoded = encode_slice(SliceRecord {
+                pos,
+                id: slice.id,
+                size: slice.size,
+                off: slice.off,
+                len: slice.len,
+            });
+            let existing: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT slices FROM jfs_chunk WHERE inode = ?1 AND indx = ?2",
+                    params![inode.as_u64() as i64, i64::from(indx)],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match existing {
+                Some(mut buf) => {
+                    buf.extend_from_slice(&encoded);
+                    tx.execute(
+                        "UPDATE jfs_chunk SET slices = ?1 WHERE inode = ?2 AND indx = ?3",
+                        params![buf, inode.as_u64() as i64, i64::from(indx)],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO jfs_chunk (inode, indx, slices) VALUES (?1, ?2, ?3)",
+                        params![inode.as_u64() as i64, i64::from(indx), &encoded[..]],
+                    )?;
+                }
+            }
+            if slice.id > 0 {
+                tx.execute(
+                    "INSERT INTO jfs_slice_ref (id, size, refs) VALUES (?1, ?2, 1)
+                     ON CONFLICT(id) DO UPDATE SET refs = refs + 1",
+                    params![slice.id as i64, i64::from(slice.size)],
+                )?;
+            }
+            let now = now_ns();
+            let (us, sub) = split_ns(now);
+            let old_len = attr.length;
+            let final_len = old_len.max(new_file_length);
+            if final_len > old_len {
+                let delta = (final_len - old_len) as i64;
+                let parent_dirs = file_parent_dirs(&tx, inode, &attr)?;
+                apply_quota_delta_dirs(&tx, &parent_dirs, delta, 0)?;
+                let _ = next_counter(&tx, "usedSpace", delta)?;
+            }
+            attr.length = final_len;
+            attr.mtime = now / 1_000_000_000;
+            attr.mtime_nsec = (now % 1_000_000_000) as u32;
+            attr.ctime = attr.mtime;
+            attr.ctime_nsec = attr.mtime_nsec;
+
+            tx.execute(
+                "UPDATE jfs_node SET length = ?1, mtime = ?2, mtimensec = ?3, ctime = ?2, ctimensec = ?3 WHERE inode = ?4",
+                params![final_len as i64, us, sub, inode.as_u64() as i64],
+            )?;
+            tx.commit()?;
+            Ok(attr)
+        })
+        .await
+    }
+
+    async fn truncate(&self, inode: Ino, length: u64) -> Result<Attr, MetaError> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let mut attr = read_attr(&tx, inode)?;
+            if !attr.is_file() {
+                return Err(MetaError::IsDir(format!("inode {inode}")));
+            }
+            let old_len = attr.length;
+            if length < old_len {
+                let first_drop_indx = length.div_ceil(CHUNK_SIZE) as u32;
+                let mut stmt = tx.prepare(
+                    "SELECT indx, slices FROM jfs_chunk WHERE inode = ?1 AND indx >= ?2",
+                )?;
+                let rows = stmt.query_map(
+                    params![inode.as_u64() as i64, i64::from(first_drop_indx)],
+                    |r| Ok((r.get::<_, u32>(0)?, r.get::<_, Vec<u8>>(1)?)),
+                )?;
+                let mut dropped = Vec::new();
+                for row in rows {
+                    dropped.push(row?);
+                }
+                drop(stmt);
+                for (indx, blob) in dropped {
+                    for rec in decode_slices(&blob)? {
+                        if rec.id > 0 {
+                            tx.execute(
+                                "UPDATE jfs_slice_ref SET refs = refs - 1 WHERE id = ?1",
+                                params![rec.id as i64],
+                            )?;
+                        }
+                    }
+                    tx.execute(
+                        "DELETE FROM jfs_chunk WHERE inode = ?1 AND indx = ?2",
+                        params![inode.as_u64() as i64, i64::from(indx)],
+                    )?;
+                }
+            }
+            let delta = length as i64 - old_len as i64;
+            if delta != 0 {
+                let parent_dirs = file_parent_dirs(&tx, inode, &attr)?;
+                apply_quota_delta_dirs(&tx, &parent_dirs, delta, 0)?;
+                let _ = next_counter(&tx, "usedSpace", delta)?;
+            }
+            let now = now_ns();
+            let (us, sub) = split_ns(now);
+            attr.length = length;
+            attr.mtime = now / 1_000_000_000;
+            attr.mtime_nsec = (now % 1_000_000_000) as u32;
+            attr.ctime = attr.mtime;
+            attr.ctime_nsec = attr.mtime_nsec;
+            tx.execute(
+                "UPDATE jfs_node SET length = ?1, mtime = ?2, mtimensec = ?3, ctime = ?2, ctimensec = ?3 WHERE inode = ?4",
+                params![length as i64, us, sub, inode.as_u64() as i64],
+            )?;
+            tx.commit()?;
+            Ok(attr)
+        })
+        .await
+    }
+
+    async fn set_xattr(&self, inode: Ino, name: &str, value: &[u8]) -> Result<(), MetaError> {
+        let name = name.to_owned();
+        let value = value.to_vec();
+        self.run(move |conn| {
+            let _ = read_attr(conn, inode)?;
+            conn.execute(
+                "INSERT INTO jfs_xattr (inode, name, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(inode, name) DO UPDATE SET value = ?3",
+                params![inode.as_u64() as i64, name, value],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_xattr(&self, inode: Ino, name: &str) -> Result<Vec<u8>, MetaError> {
+        let name = name.to_owned();
+        self.run(move |conn| {
+            let val: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT value FROM jfs_xattr WHERE inode = ?1 AND name = ?2",
+                    params![inode.as_u64() as i64, name],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            val.ok_or_else(|| MetaError::NotFound(name))
+        })
+        .await
+    }
+
+    async fn list_xattr(&self, inode: Ino) -> Result<Vec<String>, MetaError> {
+        self.run(move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT name FROM jfs_xattr WHERE inode = ?1 ORDER BY name")?;
+            let rows = stmt.query_map(params![inode.as_u64() as i64], |r| r.get::<_, String>(0))?;
+            let mut names = Vec::new();
+            for row in rows {
+                names.push(row?);
+            }
+            Ok(names)
+        })
+        .await
+    }
+
+    async fn remove_xattr(&self, inode: Ino, name: &str) -> Result<(), MetaError> {
+        let name = name.to_owned();
+        self.run(move |conn| {
+            let changed = conn.execute(
+                "DELETE FROM jfs_xattr WHERE inode = ?1 AND name = ?2",
+                params![inode.as_u64() as i64, name],
+            )?;
+            if changed == 0 {
+                return Err(MetaError::NotFound(name));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_orphan_slices(&self) -> Result<Vec<(u64, u32)>, MetaError> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare("SELECT id, size FROM jfs_slice_ref WHERE refs <= 0")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get::<_, u32>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn purge_orphan_slice(&self, slice_id: u64) -> Result<(), MetaError> {
+        self.run(move |conn| {
+            conn.execute(
+                "DELETE FROM jfs_slice_ref WHERE id = ?1 AND refs <= 0",
+                params![slice_id as i64],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn flock(&self, inode: Ino, owner: u64, ltype: FlockType) -> Result<(), MetaError> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let ino_raw = inode.as_u64() as i64;
+            let owner_raw = owner as i64;
+
+            if ltype == FlockType::Unlock {
+                tx.execute(
+                    "DELETE FROM jfs_flock WHERE inode = ?1 AND sid = 0 AND owner = ?2",
+                    params![ino_raw, owner_raw],
+                )?;
+                tx.commit()?;
+                return Ok(());
+            }
+
+            let _ = read_attr(&tx, inode)?;
+            let mut stmt =
+                tx.prepare("SELECT sid, owner, ltype FROM jfs_flock WHERE inode = ?1")?;
+            let rows = stmt.query_map(params![ino_raw], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, u8>(2)?,
+                ))
+            })?;
+            let mut existing_self = false;
+            for row in rows {
+                let (sid, row_owner, raw_typ) = row?;
+                if sid == 0 && row_owner == owner {
+                    existing_self = true;
+                    continue;
+                }
+                let other_typ = FlockType::try_from(raw_typ)?;
+                if ltype == FlockType::Exclusive || other_typ == FlockType::Exclusive {
+                    return Err(MetaError::WouldBlock(format!(
+                        "flock conflict on inode {inode}"
+                    )));
+                }
+            }
+            drop(stmt);
+
+            if existing_self {
+                tx.execute(
+                    "UPDATE jfs_flock SET ltype = ?1 WHERE inode = ?2 AND sid = 0 AND owner = ?3",
+                    params![ltype as u8, ino_raw, owner_raw],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT INTO jfs_flock (inode, sid, owner, ltype) VALUES (?1, 0, ?2, ?3)",
+                    params![ino_raw, owner_raw, ltype as u8],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn get_lk(
+        &self,
+        inode: Ino,
+        owner: u64,
+        lock: PlockRecord,
+    ) -> Result<PlockRecord, MetaError> {
+        if lock.typ == FlockType::Unlock {
+            return Ok(PlockRecord {
+                typ: FlockType::Unlock,
+                pid: 0,
+                start: 0,
+                end: 0,
+            });
+        }
+        if lock.start > lock.end {
+            return Err(MetaError::InvalidInput(format!(
+                "invalid lock range: {}..{}",
+                lock.start, lock.end
+            )));
+        }
+        self.run(move |conn| {
+            let _ = read_attr(conn, inode)?;
+            let mut stmt =
+                conn.prepare("SELECT sid, owner, records FROM jfs_plock WHERE inode = ?1")?;
+            let rows = stmt.query_map(params![inode.as_u64() as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (sid, row_owner, blob) = row?;
+                if sid == 0 && row_owner == owner {
+                    continue;
+                }
+                for rec in decode_plocks(&blob)? {
+                    if (lock.typ == FlockType::Exclusive || rec.typ == FlockType::Exclusive)
+                        && lock.end >= rec.start
+                        && lock.start <= rec.end
+                    {
+                        return Ok(PlockRecord {
+                            typ: rec.typ,
+                            pid: if sid == 0 { rec.pid } else { 0 },
+                            start: rec.start,
+                            end: rec.end,
+                        });
+                    }
+                }
+            }
+            Ok(PlockRecord {
+                typ: FlockType::Unlock,
+                pid: 0,
+                start: 0,
+                end: 0,
+            })
+        })
+        .await
+    }
+
+    async fn set_lk(&self, inode: Ino, owner: u64, lock: PlockRecord) -> Result<(), MetaError> {
+        if lock.start > lock.end {
+            return Err(MetaError::InvalidInput(format!(
+                "invalid lock range: {}..{}",
+                lock.start, lock.end
+            )));
+        }
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let _ = read_attr(&tx, inode)?;
+            let ino_raw = inode.as_u64() as i64;
+            let owner_raw = owner as i64;
+
+            if lock.typ == FlockType::Unlock {
+                let existing: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT records FROM jfs_plock WHERE inode = ?1 AND sid = 0 AND owner = ?2",
+                        params![ino_raw, owner_raw],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(blob) = existing {
+                    let updated = update_plocks(decode_plocks(&blob)?, lock);
+                    if updated.is_empty() {
+                        tx.execute(
+                            "DELETE FROM jfs_plock WHERE inode = ?1 AND sid = 0 AND owner = ?2",
+                            params![ino_raw, owner_raw],
+                        )?;
+                    } else {
+                        tx.execute(
+                            "UPDATE jfs_plock SET records = ?1 WHERE inode = ?2 AND sid = 0 AND owner = ?3",
+                            params![encode_plocks(&updated), ino_raw, owner_raw],
+                        )?;
+                    }
+                }
+                tx.commit()?;
+                return Ok(());
+            }
+
+            let mut stmt =
+                tx.prepare("SELECT sid, owner, records FROM jfs_plock WHERE inode = ?1")?;
+            let rows = stmt.query_map(params![ino_raw], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })?;
+            let mut self_records = Vec::new();
+            let mut has_self_row = false;
+            for row in rows {
+                let (sid, row_owner, blob) = row?;
+                let recs = decode_plocks(&blob)?;
+                if sid == 0 && row_owner == owner {
+                    has_self_row = true;
+                    self_records = recs;
+                    continue;
+                }
+                for rec in recs {
+                    if (lock.typ == FlockType::Exclusive || rec.typ == FlockType::Exclusive)
+                        && lock.end >= rec.start
+                        && lock.start <= rec.end
+                    {
+                        return Err(MetaError::WouldBlock(format!(
+                            "plock conflict on inode {inode} range {}..{}",
+                            lock.start, lock.end
+                        )));
+                    }
+                }
+            }
+            drop(stmt);
+
+            let updated = update_plocks(self_records, lock);
+            let encoded = encode_plocks(&updated);
+            if has_self_row {
+                tx.execute(
+                    "UPDATE jfs_plock SET records = ?1 WHERE inode = ?2 AND sid = 0 AND owner = ?3",
+                    params![encoded, ino_raw, owner_raw],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT INTO jfs_plock (inode, sid, owner, records) VALUES (?1, 0, ?2, ?3)",
+                    params![ino_raw, owner_raw, encoded],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn set_quota(
+        &self,
+        inode: Ino,
+        max_space: i64,
+        max_inodes: i64,
+    ) -> Result<Quota, MetaError> {
+        self.run(move |conn| {
+            if inode.is_trash() {
+                return Err(MetaError::InvalidInput(
+                    "cannot set quota on trash inode".to_owned(),
+                ));
+            }
+            let tx = conn.transaction()?;
+            let attr = read_attr(&tx, inode)?;
+            if !attr.is_dir() {
+                return Err(MetaError::NotDir(format!("inode {inode}")));
+            }
+
+            let existing: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT used_space, used_inodes FROM jfs_dir_quota WHERE inode = ?1",
+                    params![inode.as_u64() as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+
+            let (used_space, used_inodes) = match existing {
+                Some(pair) => pair,
+                None => calc_dir_descendant_usage(&tx, inode)?,
+            };
+
+            tx.execute(
+                "INSERT INTO jfs_dir_quota (inode, max_space, max_inodes, used_space, used_inodes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(inode) DO UPDATE SET max_space = ?2, max_inodes = ?3",
+                params![
+                    inode.as_u64() as i64,
+                    max_space,
+                    max_inodes,
+                    used_space,
+                    used_inodes
+                ],
+            )?;
+            tx.commit()?;
+            Ok(Quota {
+                max_space,
+                max_inodes,
+                used_space,
+                used_inodes,
+            })
+        })
+        .await
+    }
+
+    async fn get_quota(&self, inode: Ino) -> Result<Quota, MetaError> {
+        self.run(move |conn| {
+            let quota: Option<Quota> = conn
+                .query_row(
+                    "SELECT max_space, max_inodes, used_space, used_inodes
+                     FROM jfs_dir_quota WHERE inode = ?1",
+                    params![inode.as_u64() as i64],
+                    |r| {
+                        Ok(Quota {
+                            max_space: r.get(0)?,
+                            max_inodes: r.get(1)?,
+                            used_space: r.get(2)?,
+                            used_inodes: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+            quota.ok_or_else(|| MetaError::NotFound(format!("quota for inode {inode}")))
+        })
+        .await
+    }
+
+    async fn del_quota(&self, inode: Ino) -> Result<(), MetaError> {
+        self.run(move |conn| {
+            let changed = conn.execute(
+                "DELETE FROM jfs_dir_quota WHERE inode = ?1",
+                params![inode.as_u64() as i64],
+            )?;
+            if changed == 0 {
+                return Err(MetaError::NotFound(format!("quota for inode {inode}")));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_quotas(&self) -> Result<Vec<(Ino, Quota)>, MetaError> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT inode, max_space, max_inodes, used_space, used_inodes
+                 FROM jfs_dir_quota ORDER BY inode",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    Ino(r.get::<_, i64>(0)? as u64),
+                    Quota {
+                        max_space: r.get(1)?,
+                        max_inodes: r.get(2)?,
+                        used_space: r.get(3)?,
+                        used_inodes: r.get(4)?,
+                    },
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn move_to_trash(&self, parent: Ino, name: &str) -> Result<String, MetaError> {
+        validate_name(name)?;
+        if parent.is_trash() {
+            return Err(MetaError::InvalidInput(
+                "cannot move trash entry into trash".to_owned(),
+            ));
+        }
+        let name = name.to_owned();
+        self.run(move |conn| {
+            let fmt = load_format_sync(conn)?;
+            if fmt.trash_days <= 0 {
+                return Err(MetaError::InvalidInput(
+                    "trash is disabled (trash_days <= 0)".to_owned(),
+                ));
+            }
+            let tx = conn.transaction()?;
+            let now = now_ns();
+            ensure_trash_node(&tx, now)?;
+
+            let row: Option<(i64, u8)> = tx
+                .query_row(
+                    "SELECT inode, type FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![parent.as_u64() as i64, name.as_bytes()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let (ino_raw, typ_raw) = row.ok_or_else(|| MetaError::NotFound(name.clone()))?;
+            let ino = Ino(ino_raw as u64);
+            let is_dir = NodeType::try_from(typ_raw)? == NodeType::Directory;
+            let trash_name = make_trash_entry_name(parent, ino, &name);
+
+            let (moved_space, moved_inodes) = if is_dir {
+                let (s, i) = calc_dir_descendant_usage(&tx, ino)?;
+                (s, i + 1)
+            } else {
+                let attr = read_attr(&tx, ino)?;
+                (attr.length as i64, 1)
+            };
+            apply_quota_delta(&tx, parent, -moved_space, -moved_inodes)?;
+
+            tx.execute(
+                "DELETE FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                params![parent.as_u64() as i64, name.as_bytes()],
+            )?;
+            tx.execute(
+                "INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    TRASH_INODE.as_u64() as i64,
+                    trash_name.as_bytes(),
+                    ino_raw,
+                    typ_raw
+                ],
+            )?;
+            tx.execute(
+                "UPDATE jfs_node SET parent = ?1 WHERE inode = ?2 AND parent != 0",
+                params![TRASH_INODE.as_u64() as i64, ino_raw],
+            )?;
+            if is_dir {
+                tx.execute(
+                    "UPDATE jfs_node SET nlink = MAX(2, nlink - 1) WHERE inode = ?1",
+                    params![parent.as_u64() as i64],
+                )?;
+                tx.execute(
+                    "UPDATE jfs_node SET nlink = nlink + 1 WHERE inode = ?1",
+                    params![TRASH_INODE.as_u64() as i64],
+                )?;
+            }
+            update_parent_mtime(&tx, parent, now)?;
+            update_parent_mtime(&tx, TRASH_INODE, now)?;
+            tx.commit()?;
+            Ok(trash_name)
+        })
+        .await
+    }
+
+    async fn empty_trash(&self) -> Result<u64, MetaError> {
+        self.run(|conn| {
+            let tx = conn.transaction()?;
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT inode FROM jfs_node WHERE inode = ?1",
+                    params![TRASH_INODE.as_u64() as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                return Ok(0);
+            }
+            let deleted = purge_trash_dir_recursive(&tx, TRASH_INODE)?;
+            let now = now_ns();
+            let (us, sub) = split_ns(now);
+            tx.execute(
+                "UPDATE jfs_node SET nlink = 2, mtime = ?1, mtimensec = ?2, ctime = ?1, ctimensec = ?2
+                 WHERE inode = ?3",
+                params![us, sub, TRASH_INODE.as_u64() as i64],
+            )?;
+            tx.commit()?;
+            Ok(deleted)
+        })
+        .await
+    }
+
+    async fn restore_from_trash(&self, trash_name: &str) -> Result<(Ino, Attr), MetaError> {
+        validate_name(trash_name)?;
+        let trash_name = trash_name.to_owned();
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let row: Option<(i64, u8)> = tx
+                .query_row(
+                    "SELECT inode, type FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![TRASH_INODE.as_u64() as i64, trash_name.as_bytes()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let (ino_raw, typ_raw) = row.ok_or_else(|| MetaError::NotFound(trash_name.clone()))?;
+            let ino = Ino(ino_raw as u64);
+
+            let (orig_parent, _orig_ino, orig_name) = parse_trash_entry_name(&trash_name)?;
+            let pattr = read_attr(&tx, orig_parent)?;
+            if !pattr.is_dir() {
+                return Err(MetaError::NotDir(format!("inode {orig_parent}")));
+            }
+            let conflict: Option<i64> = tx
+                .query_row(
+                    "SELECT inode FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![orig_parent.as_u64() as i64, orig_name.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if conflict.is_some() {
+                return Err(MetaError::AlreadyExists(orig_name.to_owned()));
+            }
+
+            let is_dir = NodeType::try_from(typ_raw)? == NodeType::Directory;
+            let (restored_space, restored_inodes) = if is_dir {
+                let (s, i) = calc_dir_descendant_usage(&tx, ino)?;
+                (s, i + 1)
+            } else {
+                let attr = read_attr(&tx, ino)?;
+                (attr.length as i64, 1)
+            };
+            apply_quota_delta(&tx, orig_parent, restored_space, restored_inodes)?;
+
+            tx.execute(
+                "DELETE FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                params![TRASH_INODE.as_u64() as i64, trash_name.as_bytes()],
+            )?;
+            tx.execute(
+                "INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    orig_parent.as_u64() as i64,
+                    orig_name.as_bytes(),
+                    ino_raw,
+                    typ_raw
+                ],
+            )?;
+            tx.execute(
+                "UPDATE jfs_node SET parent = ?1 WHERE inode = ?2 AND parent != 0",
+                params![orig_parent.as_u64() as i64, ino_raw],
+            )?;
+            if is_dir {
+                tx.execute(
+                    "UPDATE jfs_node SET nlink = MAX(2, nlink - 1) WHERE inode = ?1",
+                    params![TRASH_INODE.as_u64() as i64],
+                )?;
+                tx.execute(
+                    "UPDATE jfs_node SET nlink = nlink + 1 WHERE inode = ?1",
+                    params![orig_parent.as_u64() as i64],
+                )?;
+            }
+            let now = now_ns();
+            update_parent_mtime(&tx, TRASH_INODE, now)?;
+            update_parent_mtime(&tx, orig_parent, now)?;
+            let attr = read_attr(&tx, ino)?;
+            tx.commit()?;
+            Ok((ino, attr))
+        })
+        .await
+    }
+
+    async fn dump_json(&self) -> Result<String, MetaError> {
+        self.run(|conn| crate::dump::dump_to_json(conn)).await
+    }
+
+    async fn load_json(&self, json: &str) -> Result<(), MetaError> {
+        let json = json.to_owned();
+        self.run(move |conn| crate::dump::load_from_json(conn, &json))
+            .await
+    }
+
+    async fn fsck(&self) -> Result<FsckReport, MetaError> {
+        self.run(|conn| fsck_sync(conn)).await
+    }
+
+    async fn compact_chunk(
+        &self,
+        inode: Ino,
+        indx: u32,
+        old_count: usize,
+        new_slice: Slice,
+    ) -> Result<(), MetaError> {
+        if old_count == 0 {
+            return Err(MetaError::InvalidInput(
+                "old_count must be at least 1".to_owned(),
+            ));
+        }
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let attr = read_attr(&tx, inode)?;
+            if !attr.is_file() {
+                return Err(MetaError::IsDir(format!("inode {inode}")));
+            }
+            let blob: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT slices FROM jfs_chunk WHERE inode = ?1 AND indx = ?2",
+                    params![inode.as_u64() as i64, i64::from(indx)],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let blob =
+                blob.ok_or_else(|| MetaError::NotFound(format!("chunk {inode}:{indx} not found")))?;
+            let records = decode_slices(&blob)?;
+            if records.len() < old_count {
+                return Err(MetaError::InvalidInput(format!(
+                    "chunk {inode}:{indx} has {} slices, expected at least {old_count}",
+                    records.len()
+                )));
+            }
+
+            let old_records = &records[..old_count];
+            let (start_pos, _, _) = juicefs_core::compact_chunk(old_records);
+            let compacted_rec = SliceRecord {
+                pos: start_pos,
+                id: new_slice.id,
+                size: new_slice.size,
+                off: new_slice.off,
+                len: new_slice.len,
+            };
+
+            let tail_start = old_count * SLICE_BYTES;
+            let mut new_blob = Vec::with_capacity(SLICE_BYTES + (blob.len() - tail_start));
+            new_blob.extend_from_slice(&encode_slice(compacted_rec));
+            new_blob.extend_from_slice(&blob[tail_start..]);
+
+            tx.execute(
+                "UPDATE jfs_chunk SET slices = ?1 WHERE inode = ?2 AND indx = ?3",
+                params![new_blob, inode.as_u64() as i64, i64::from(indx)],
+            )?;
+
+            if new_slice.id > 0 {
+                tx.execute(
+                    "INSERT INTO jfs_slice_ref (id, size, refs) VALUES (?1, ?2, 1)
+                     ON CONFLICT(id) DO UPDATE SET refs = refs + 1",
+                    params![new_slice.id as i64, i64::from(new_slice.size)],
+                )?;
+            }
+            for rec in old_records {
+                if rec.id > 0 {
+                    tx.execute(
+                        "UPDATE jfs_slice_ref SET refs = refs - 1 WHERE id = ?1",
+                        params![rec.id as i64],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+fn fsck_sync(conn: &Connection) -> Result<FsckReport, MetaError> {
+    let _ = load_format_sync(conn)?;
+
+    let mut nodes: BTreeMap<u64, (NodeType, u32)> = BTreeMap::new();
+    let mut nstmt = conn.prepare("SELECT inode, type, nlink FROM jfs_node ORDER BY inode")?;
+    let nrows = nstmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)? as u64,
+            r.get::<_, u8>(1)?,
+            r.get::<_, u32>(2)?,
+        ))
+    })?;
+    for row in nrows {
+        let (ino, typ_raw, nlink) = row?;
+        nodes.insert(ino, (NodeType::try_from(typ_raw)?, nlink));
+    }
+    drop(nstmt);
+
+    let mut estmt =
+        conn.prepare("SELECT parent, name, inode, type FROM jfs_edge ORDER BY parent, name")?;
+    let erows = estmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)? as u64,
+            r.get::<_, Vec<u8>>(1)?,
+            r.get::<_, i64>(2)? as u64,
+            r.get::<_, u8>(3)?,
+        ))
+    })?;
+    let mut edges = Vec::new();
+    for row in erows {
+        edges.push(row?);
+    }
+    drop(estmt);
+
+    let mut report = FsckReport {
+        checked_nodes: nodes.len(),
+        checked_edges: edges.len(),
+        ..FsckReport::default()
+    };
+
+    let mut incoming_edges: BTreeMap<u64, u32> = BTreeMap::new();
+    let mut child_dir_count: BTreeMap<u64, u32> = BTreeMap::new();
+    let mut missing_set = std::collections::BTreeSet::new();
+
+    for (parent, name_bytes, child, edge_typ_raw) in &edges {
+        let parent_valid = nodes
+            .get(parent)
+            .is_some_and(|(typ, _)| *typ == NodeType::Directory);
+        if !parent_valid {
+            report
+                .orphaned_edges
+                .push(format!("{parent}:{}", String::from_utf8_lossy(name_bytes)));
+        }
+
+        if let Some((child_typ, _)) = nodes.get(child) {
+            *incoming_edges.entry(*child).or_insert(0) += 1;
+            if *child_typ == NodeType::Directory {
+                *child_dir_count.entry(*parent).or_insert(0) += 1;
+            }
+        } else {
+            missing_set.insert(*child);
+            if matches!(NodeType::try_from(*edge_typ_raw), Ok(NodeType::Directory)) {
+                *child_dir_count.entry(*parent).or_insert(0) += 1;
+            }
+        }
+    }
+    report.missing_nodes = missing_set.into_iter().collect();
+
+    for (&ino, &(typ, stored_nlink)) in &nodes {
+        let links = incoming_edges.get(&ino).copied().unwrap_or(0);
+        if ino != ROOT_INODE.as_u64() && ino != TRASH_INODE.as_u64() && links == 0 {
+            report.unreferenced_nodes.push(ino);
+        }
+        let expected_nlink = if typ == NodeType::Directory {
+            2 + child_dir_count.get(&ino).copied().unwrap_or(0)
+        } else {
+            links
+        };
+        if stored_nlink != expected_nlink {
+            report.nlink_mismatches.push(NlinkMismatch {
+                inode: Ino(ino),
+                stored_nlink,
+                expected_nlink,
+            });
+        }
+    }
+
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sqlite_meta_lifecycle() {
+        let meta = SqliteMeta::open(":memory:").expect("open in-memory sqlite");
+        let fmt = Format::new("testvol", "mem", "");
+        meta.init(&fmt, false).await.expect("init");
+        let loaded = meta.load().await.expect("load");
+        assert_eq!(loaded.name, "testvol");
+
+        let (dir_ino, _) = meta
+            .mkdir(ROOT_INODE, "docs", 0o755, 1000, 1000)
+            .await
+            .expect("mkdir");
+        let (file_ino, _) = meta
+            .mknod(dir_ino, "hello.txt", NodeType::File, 0o644, 1000, 1000)
+            .await
+            .expect("mknod");
+
+        let sid = meta.new_slice().await.expect("new_slice");
+        let attr = meta
+            .write_chunk(
+                file_ino,
+                0,
+                0,
+                Slice {
+                    id: sid,
+                    size: 11,
+                    off: 0,
+                    len: 11,
+                },
+                11,
+            )
+            .await
+            .expect("write_chunk");
+        assert_eq!(attr.length, 11);
+
+        let entries = meta.readdir(dir_ino).await.expect("readdir");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "hello.txt");
+
+        meta.unlink(dir_ino, "hello.txt").await.expect("unlink");
+        let orphans = meta.list_orphan_slices().await.expect("orphans");
+        assert_eq!(orphans, vec![(sid, 11)]);
+        meta.purge_orphan_slice(sid).await.expect("purge");
+    }
+}
