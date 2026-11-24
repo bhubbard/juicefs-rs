@@ -24,13 +24,24 @@ const MAX_PART_COUNT: u64 = 10_000;
 #[derive(Debug, Clone)]
 pub struct FileStore {
     root: PathBuf,
+    inplace: bool,
 }
 
 impl FileStore {
     /// Creates a [`FileStore`] rooted at `root`.
     pub fn new(root: impl AsRef<Path>) -> Result<Self, ObjectError> {
         let root = root.as_ref().to_path_buf();
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            inplace: false,
+        })
+    }
+
+    /// Enables or disables direct in-place writes (skipping temp-file + `fsync` + rename).
+    #[must_use]
+    pub const fn with_inplace(mut self, inplace: bool) -> Self {
+        self.inplace = inplace;
+        self
     }
 
     fn resolve_path(&self, key: &str) -> Result<PathBuf, ObjectError> {
@@ -154,6 +165,13 @@ impl ObjectStorage for FileStore {
 
     async fn put(&self, key: &str, data: Bytes) -> Result<(), ObjectError> {
         let path = self.resolve_path(key)?;
+        if self.inplace {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            fs::write(&path, &data).await?;
+            return Ok(());
+        }
         write_atomic(&path, &data).await
     }
 

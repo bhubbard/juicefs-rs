@@ -4,6 +4,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -54,8 +55,44 @@ enum Commands {
         /// Metadata URL
         meta_url: String,
     },
+    /// Inspect or update volume configuration
+    Config {
+        /// Metadata URL
+        meta_url: String,
+        /// Set capacity limit in bytes
+        #[arg(long)]
+        capacity: Option<u64>,
+        /// Set inode limit
+        #[arg(long)]
+        inodes: Option<u64>,
+        /// Set trash retention days
+        #[arg(long)]
+        trash_days: Option<i32>,
+    },
+    /// Destroy a volume's objects and metadata
+    Destroy {
+        /// Metadata URL
+        meta_url: String,
+        /// Volume UUID confirmation
+        uuid: String,
+    },
     /// List directory contents
     Ls {
+        /// Metadata URL
+        meta_url: String,
+        /// Path inside `JuiceFS`
+        #[arg(default_value = "/")]
+        path: String,
+    },
+    /// Show detailed inode and chunk/slice layout for a path
+    Info {
+        /// Metadata URL
+        meta_url: String,
+        /// Path inside `JuiceFS`
+        path: String,
+    },
+    /// Show recursive file, directory, and byte counts
+    Summary {
         /// Metadata URL
         meta_url: String,
         /// Path inside `JuiceFS`
@@ -123,6 +160,30 @@ enum Commands {
         /// Destination path
         dst: String,
     },
+    /// Zero-copy clone a file or directory tree
+    Clone {
+        /// Metadata URL
+        meta_url: String,
+        /// Source path inside `JuiceFS`
+        src: String,
+        /// Destination path inside `JuiceFS`
+        dst: String,
+    },
+    /// Restore a deleted entry from `.trash`
+    Restore {
+        /// Metadata URL
+        meta_url: String,
+        /// Entry name inside `.trash`
+        trash_name: String,
+    },
+    /// Warm local cache for a file or directory tree
+    Warmup {
+        /// Metadata URL
+        meta_url: String,
+        /// Path inside `JuiceFS`
+        #[arg(default_value = "/")]
+        path: String,
+    },
     /// Compact fragmented chunks of a file
     Compact {
         /// Metadata URL
@@ -154,6 +215,25 @@ enum Commands {
     Fsck {
         /// Metadata URL
         meta_url: String,
+    },
+    /// Run a read/write throughput benchmark on a `JuiceFS` volume
+    Bench {
+        /// Metadata URL
+        meta_url: String,
+        /// Directory inside `JuiceFS` for benchmark files
+        #[arg(default_value = "/.bench")]
+        path: String,
+        /// Payload size in MiB
+        #[arg(long, default_value_t = 16)]
+        size_mb: usize,
+    },
+    /// Run an object storage throughput benchmark
+    Objbench {
+        /// Storage URI (`file://`, `mem://`, `s3://`)
+        uri: String,
+        /// Payload size in MiB
+        #[arg(long, default_value_t = 16)]
+        size_mb: usize,
     },
     /// Manage directory quotas
     Quota {
@@ -241,7 +321,7 @@ fn open_sync_store(uri: &str) -> Result<Arc<dyn ObjectStorage>> {
         return Ok(Arc::new(S3Store::from_format(&fmt)?));
     }
     let path = uri.strip_prefix("file://").unwrap_or(uri);
-    Ok(Arc::new(FileStore::new(path)?))
+    Ok(Arc::new(FileStore::new(path)?.with_inplace(true)))
 }
 
 async fn cmd_format(meta_url: &str, format: &Format, force: bool) -> Result<()> {
@@ -270,6 +350,36 @@ async fn cmd_status(meta_url: &str) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_config(
+    meta_url: &str,
+    capacity: Option<u64>,
+    inodes: Option<u64>,
+    trash_days: Option<i32>,
+) -> Result<()> {
+    let meta = open_meta(meta_url).context("opening metadata store")?;
+    let mut fmt = meta.load().await?;
+    let mut changed = false;
+    if let Some(c) = capacity {
+        fmt.capacity = c;
+        changed = true;
+    }
+    if let Some(i) = inodes {
+        fmt.inodes = i;
+        changed = true;
+    }
+    if let Some(t) = trash_days {
+        fmt.trash_days = t;
+        changed = true;
+    }
+    if changed {
+        meta.update_format(&fmt).await?;
+        println!("Updated configuration for volume '{}'", fmt.name);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&fmt)?);
+    }
+    Ok(())
+}
+
 async fn cmd_ls(meta_url: &str, path: &str) -> Result<()> {
     let vfs = connect_vfs(meta_url).await?;
     for entry in vfs.readdir(path).await? {
@@ -283,6 +393,75 @@ async fn cmd_ls(meta_url: &str, path: &str) -> Result<()> {
             entry.attr.mode, entry.attr.length, entry.inode, entry.name
         );
     }
+    Ok(())
+}
+
+async fn cmd_info(meta_url: &str, path: &str) -> Result<()> {
+    let vfs = connect_vfs(meta_url).await?;
+    let info = vfs.info(path).await?;
+    println!("Inode:  {}", info.inode);
+    println!("Type:   {:?}", info.attr.typ);
+    println!("Size:   {} bytes", info.attr.length);
+    println!("Chunks: {}", info.chunks.len());
+    for (indx, slices) in info.chunks {
+        println!("  chunk[{indx}]: {} slice(s)", slices.len());
+        for s in slices {
+            println!(
+                "    id={} size={} off={} len={}",
+                s.id, s.size, s.off, s.len
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_bench(meta_url: &str, path: &str, size_mb: usize) -> Result<()> {
+    let vfs = connect_vfs(meta_url).await?;
+    vfs.mkdir_p(path, 0o755).await?;
+    let file_path = format!("{}/bench.bin", path.trim_end_matches('/'));
+    let payload = vec![0x5Au8; size_mb * 1024 * 1024];
+
+    let t0 = Instant::now();
+    vfs.write_file(&file_path, &payload).await?;
+    let write_s = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    let read_back = vfs.read_file(&file_path).await?;
+    let read_s = t1.elapsed().as_secs_f64();
+    anyhow::ensure!(read_back.len() == payload.len(), "read length mismatch");
+
+    vfs.rm_rf(path).await?;
+    let _ = vfs.gc_orphans().await?;
+
+    println!(
+        "Bench ({size_mb} MiB): write={:.2} MiB/s ({write_s:.3}s), read={:.2} MiB/s ({read_s:.3}s)",
+        size_mb as f64 / write_s.max(1e-6),
+        size_mb as f64 / read_s.max(1e-6),
+    );
+    Ok(())
+}
+
+async fn cmd_objbench(uri: &str, size_mb: usize) -> Result<()> {
+    let store = open_sync_store(uri)?;
+    store.create().await?;
+    let key = format!("objbench_{}.bin", std::process::id());
+    let payload = bytes::Bytes::from(vec![0xA5u8; size_mb * 1024 * 1024]);
+
+    let t0 = Instant::now();
+    store.put(&key, payload.clone()).await?;
+    let put_s = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    let got = store.get(&key, 0, 0).await?;
+    let get_s = t1.elapsed().as_secs_f64();
+    anyhow::ensure!(got.len() == payload.len(), "object length mismatch");
+    store.delete(&key).await?;
+
+    println!(
+        "Objbench ({size_mb} MiB): put={:.2} MiB/s ({put_s:.3}s), get={:.2} MiB/s ({get_s:.3}s)",
+        size_mb as f64 / put_s.max(1e-6),
+        size_mb as f64 / get_s.max(1e-6),
+    );
     Ok(())
 }
 
@@ -381,6 +560,24 @@ async fn dispatch_io(command: Commands) -> Result<()> {
             let vfs = connect_vfs(&meta_url).await?;
             vfs.rename(&src, &dst).await?;
         }
+        Commands::Clone { meta_url, src, dst } => {
+            let vfs = connect_vfs(&meta_url).await?;
+            let (ino, _) = vfs.clone_path(&src, &dst).await?;
+            println!("Cloned {src} -> {dst} (inode {ino})");
+        }
+        Commands::Restore {
+            meta_url,
+            trash_name,
+        } => {
+            let meta = open_meta(&meta_url).context("opening metadata store")?;
+            let (ino, _) = meta.restore_from_trash(&trash_name).await?;
+            println!("Restored '{trash_name}' (inode {ino})");
+        }
+        Commands::Warmup { meta_url, path } => {
+            let vfs = connect_vfs(&meta_url).await?;
+            let (files, bytes) = vfs.warmup(&path).await?;
+            println!("Warmed up {files} file(s), {bytes} bytes");
+        }
         Commands::Compact { meta_url, path } => {
             let vfs = connect_vfs(&meta_url).await?;
             let compacted = vfs.compact_file(&path).await?;
@@ -396,37 +593,18 @@ async fn dispatch_io(command: Commands) -> Result<()> {
     Ok(())
 }
 
-async fn dispatch(command: Commands) -> Result<()> {
+async fn dispatch_admin(command: Commands) -> Result<()> {
     match command {
-        Commands::Format {
-            meta_url,
-            name,
-            storage,
-            bucket,
-            block_size,
-            compress,
-            hash_prefix,
-            force,
-        } => {
-            let mut fmt = Format::new(&name, &storage, &bucket);
-            fmt.block_size = block_size * 1024;
-            fmt.compression = compress;
-            fmt.hash_prefix = hash_prefix;
-            cmd_format(&meta_url, &fmt, force).await?;
-        }
-        Commands::Status { meta_url } => cmd_status(&meta_url).await?,
-        Commands::Ls { meta_url, path } => cmd_ls(&meta_url, &path).await?,
-        Commands::Mkdir {
-            meta_url,
-            path,
-            parents,
-        } => {
+        Commands::Destroy { meta_url, uuid } => {
             let vfs = connect_vfs(&meta_url).await?;
-            if parents {
-                vfs.mkdir_p(&path, 0o755).await?;
-            } else {
-                vfs.mkdir(&path, 0o755).await?;
+            anyhow::ensure!(vfs.format().uuid == uuid, "UUID mismatch");
+            let deleted = vfs.destroy_objects().await?;
+            if let Some(db_path) = meta_url.strip_prefix("sqlite3://")
+                && db_path != ":memory:"
+            {
+                let _ = tokio::fs::remove_file(db_path).await;
             }
+            println!("Destroyed volume '{uuid}' ({deleted} objects removed)");
         }
         Commands::Dump { meta_url, output } => {
             let meta = open_meta(&meta_url).context("opening metadata store")?;
@@ -454,7 +632,62 @@ async fn dispatch(command: Commands) -> Result<()> {
             );
             anyhow::ensure!(report.is_clean(), "metadata inconsistencies detected");
         }
+        Commands::Bench {
+            meta_url,
+            path,
+            size_mb,
+        } => cmd_bench(&meta_url, &path, size_mb).await?,
+        Commands::Objbench { uri, size_mb } => cmd_objbench(&uri, size_mb).await?,
         Commands::Quota { action } => cmd_quota(action).await?,
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+async fn dispatch(command: Commands) -> Result<()> {
+    match command {
+        Commands::Format {
+            meta_url,
+            name,
+            storage,
+            bucket,
+            block_size,
+            compress,
+            hash_prefix,
+            force,
+        } => {
+            let mut fmt = Format::new(&name, &storage, &bucket);
+            fmt.block_size = block_size * 1024;
+            fmt.compression = compress;
+            fmt.hash_prefix = hash_prefix;
+            cmd_format(&meta_url, &fmt, force).await?;
+        }
+        Commands::Status { meta_url } => cmd_status(&meta_url).await?,
+        Commands::Config {
+            meta_url,
+            capacity,
+            inodes,
+            trash_days,
+        } => cmd_config(&meta_url, capacity, inodes, trash_days).await?,
+        Commands::Ls { meta_url, path } => cmd_ls(&meta_url, &path).await?,
+        Commands::Info { meta_url, path } => cmd_info(&meta_url, &path).await?,
+        Commands::Summary { meta_url, path } => {
+            let vfs = connect_vfs(&meta_url).await?;
+            let s = vfs.summary(&path).await?;
+            println!("Dirs:  {}\nFiles: {}\nBytes: {}", s.dirs, s.files, s.bytes);
+        }
+        Commands::Mkdir {
+            meta_url,
+            path,
+            parents,
+        } => {
+            let vfs = connect_vfs(&meta_url).await?;
+            if parents {
+                vfs.mkdir_p(&path, 0o755).await?;
+            } else {
+                vfs.mkdir(&path, 0o755).await?;
+            }
+        }
         Commands::Sync {
             src,
             dst,
@@ -489,6 +722,13 @@ async fn dispatch(command: Commands) -> Result<()> {
             tokio::signal::ctrl_c().await?;
             server.shutdown().await;
         }
+        cmd @ (Commands::Destroy { .. }
+        | Commands::Dump { .. }
+        | Commands::Load { .. }
+        | Commands::Fsck { .. }
+        | Commands::Bench { .. }
+        | Commands::Objbench { .. }
+        | Commands::Quota { .. }) => dispatch_admin(cmd).await?,
         other => dispatch_io(other).await?,
     }
     Ok(())

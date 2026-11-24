@@ -526,6 +526,140 @@ impl Vfs {
         }
         Ok(count)
     }
+
+    /// Returns detailed inode, attribute, and chunk/slice layout for `path`.
+    pub async fn info(&self, path: &str) -> Result<NodeInfo, VfsError> {
+        let (inode, attr) = self.resolve_path(path).await?;
+        let mut chunks = Vec::new();
+        if attr.is_file() && attr.length > 0 {
+            let num_chunks = attr.length.div_ceil(CHUNK_SIZE) as u32;
+            for indx in 0..num_chunks {
+                let slices = self.meta.read_chunk(inode, indx).await?;
+                if !slices.is_empty() {
+                    chunks.push((indx, slices));
+                }
+            }
+        }
+        Ok(NodeInfo {
+            inode,
+            attr,
+            chunks,
+        })
+    }
+
+    /// Computes recursive file, directory, and byte counts under `path`.
+    pub async fn summary(&self, path: &str) -> Result<TreeSummary, VfsError> {
+        let (inode, attr) = self.resolve_path(path).await?;
+        let mut out = TreeSummary::default();
+        self.summary_walk(inode, &attr, &mut out).await?;
+        Ok(out)
+    }
+
+    fn summary_walk<'a>(
+        &'a self,
+        inode: Ino,
+        attr: &'a Attr,
+        out: &'a mut TreeSummary,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), VfsError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if attr.is_dir() {
+                out.dirs += 1;
+                for entry in self.meta.readdir(inode).await? {
+                    self.summary_walk(entry.inode, &entry.attr, out).await?;
+                }
+            } else {
+                out.files += 1;
+                out.bytes += attr.length;
+            }
+            Ok(())
+        })
+    }
+
+    /// Zero-copy clones a file or directory tree from `src` to `dst`.
+    pub async fn clone_path(&self, src: &str, dst: &str) -> Result<(Ino, Attr), VfsError> {
+        let (src_parent, src_name) = self.resolve_parent(src).await?;
+        let (dst_parent, dst_name) = self.resolve_parent(dst).await?;
+        Ok(self
+            .meta
+            .clone_entry(src_parent, &src_name, dst_parent, &dst_name)
+            .await?)
+    }
+
+    /// Warms the local block cache by reading all non-sparse slices under `path`.
+    pub async fn warmup(&self, path: &str) -> Result<(usize, u64), VfsError> {
+        let (inode, attr) = self.resolve_path(path).await?;
+        let mut files = 0usize;
+        let mut bytes = 0u64;
+        self.warmup_walk(inode, &attr, &mut files, &mut bytes)
+            .await?;
+        Ok((files, bytes))
+    }
+
+    fn warmup_walk<'a>(
+        &'a self,
+        inode: Ino,
+        attr: &'a Attr,
+        files: &'a mut usize,
+        bytes: &'a mut u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), VfsError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if attr.is_dir() {
+                for entry in self.meta.readdir(inode).await? {
+                    self.warmup_walk(entry.inode, &entry.attr, files, bytes)
+                        .await?;
+                }
+            } else if attr.is_file() && attr.length > 0 {
+                let mut buf = vec![0u8; attr.length.min(1 << 20) as usize];
+                let mut off = 0u64;
+                while off < attr.length {
+                    let n = self.read_at(inode, off, &mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    off += n as u64;
+                }
+                *files += 1;
+                *bytes += attr.length;
+            }
+            Ok(())
+        })
+    }
+
+    /// Deletes all objects stored in the underlying volume prefix.
+    pub async fn destroy_objects(&self) -> Result<usize, VfsError> {
+        let store = self.chunks.blob_storage();
+        let items = store.list("").await?;
+        let mut deleted = 0usize;
+        for item in items {
+            store.delete(&item.key).await?;
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
+}
+
+/// Detailed inode, attribute, and chunk/slice layout returned by [`Vfs::info`].
+#[derive(Debug, Clone)]
+pub struct NodeInfo {
+    /// Inode number.
+    pub inode: Ino,
+    /// Node attributes.
+    pub attr: Attr,
+    /// Non-empty chunks as `(chunk_index, slices)`.
+    pub chunks: Vec<(u32, Vec<Slice>)>,
+}
+
+/// Recursive directory tree summary returned by [`Vfs::summary`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TreeSummary {
+    /// Number of non-directory entries.
+    pub files: u64,
+    /// Number of directories (including the root of the walk).
+    pub dirs: u64,
+    /// Total logical file bytes.
+    pub bytes: u64,
 }
 
 fn split_path(path: &str) -> impl Iterator<Item = &str> {

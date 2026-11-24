@@ -2329,6 +2329,191 @@ impl Meta for SqliteMeta {
         })
         .await
     }
+
+    async fn update_format(&self, format: &Format) -> Result<(), MetaError> {
+        let format_json = serde_json::to_string(format)?;
+        self.run(move |conn| {
+            let changed = conn.execute(
+                "UPDATE jfs_setting SET value = ?1 WHERE name = 'format'",
+                params![format_json],
+            )?;
+            if changed == 0 {
+                return Err(MetaError::NotFormatted);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn clone_entry(
+        &self,
+        src_parent: Ino,
+        src_name: &str,
+        dst_parent: Ino,
+        dst_name: &str,
+    ) -> Result<(Ino, Attr), MetaError> {
+        validate_name(src_name)?;
+        validate_name(dst_name)?;
+        let src_name = src_name.to_owned();
+        let dst_name = dst_name.to_owned();
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let src_ino_raw: Option<i64> = tx
+                .query_row(
+                    "SELECT inode FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![src_parent.as_u64() as i64, src_name.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let src_ino =
+                Ino(src_ino_raw.ok_or_else(|| MetaError::NotFound(src_name.clone()))? as u64);
+            let dst_parent_attr = read_attr(&tx, dst_parent)?;
+            if !dst_parent_attr.is_dir() {
+                return Err(MetaError::NotDir(format!("inode {dst_parent}")));
+            }
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT inode FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+                    params![dst_parent.as_u64() as i64, dst_name.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                return Err(MetaError::AlreadyExists(dst_name));
+            }
+            let now = now_ns();
+            let result = clone_node_recursive(&tx, src_ino, dst_parent, &dst_name, now)?;
+            update_parent_mtime(&tx, dst_parent, now)?;
+            tx.commit()?;
+            Ok(result)
+        })
+        .await
+    }
+}
+
+fn clone_node_recursive(
+    tx: &Transaction<'_>,
+    src_ino: Ino,
+    dst_parent: Ino,
+    dst_name: &str,
+    now: i64,
+) -> Result<(Ino, Attr), MetaError> {
+    let mut attr = read_attr(tx, src_ino)?;
+    let new_ino = Ino(next_counter(tx, "nextInode", 1)? as u64);
+    let _ = next_counter(tx, "usedInodes", 1)?;
+
+    let sec = now / 1_000_000_000;
+    let nsec = (now % 1_000_000_000) as u32;
+    attr.parent = dst_parent;
+    attr.nlink = if attr.is_dir() { 2 } else { 1 };
+    attr.atime = sec;
+    attr.mtime = sec;
+    attr.ctime = sec;
+    attr.atime_nsec = nsec;
+    attr.mtime_nsec = nsec;
+    attr.ctime_nsec = nsec;
+
+    insert_node(tx, new_ino, &attr)?;
+    tx.execute(
+        "INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            dst_parent.as_u64() as i64,
+            dst_name.as_bytes(),
+            new_ino.as_u64() as i64,
+            attr.typ as u8
+        ],
+    )?;
+
+    if attr.is_file() {
+        if attr.length > 0 {
+            let _ = next_counter(tx, "usedSpace", attr.length as i64)?;
+        }
+        let mut stmt = tx.prepare("SELECT indx, slices FROM jfs_chunk WHERE inode = ?1")?;
+        let rows = stmt.query_map(params![src_ino.as_u64() as i64], |r| {
+            Ok((r.get::<_, u32>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        let mut chunks = Vec::new();
+        for row in rows {
+            chunks.push(row?);
+        }
+        drop(stmt);
+
+        for (indx, blob) in chunks {
+            tx.execute(
+                "INSERT INTO jfs_chunk (inode, indx, slices) VALUES (?1, ?2, ?3)",
+                params![new_ino.as_u64() as i64, i64::from(indx), &blob],
+            )?;
+            for rec in decode_slices(&blob)? {
+                if rec.id > 0 {
+                    tx.execute(
+                        "UPDATE jfs_slice_ref SET refs = refs + 1 WHERE id = ?1",
+                        params![rec.id as i64],
+                    )?;
+                }
+            }
+        }
+    } else if attr.is_symlink() {
+        let target: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT target FROM jfs_symlink WHERE inode = ?1",
+                params![src_ino.as_u64() as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(t) = target {
+            tx.execute(
+                "INSERT INTO jfs_symlink (inode, target) VALUES (?1, ?2)",
+                params![new_ino.as_u64() as i64, t],
+            )?;
+        }
+    } else if attr.is_dir() {
+        tx.execute(
+            "UPDATE jfs_node SET nlink = nlink + 1 WHERE inode = ?1",
+            params![dst_parent.as_u64() as i64],
+        )?;
+        let mut stmt =
+            tx.prepare("SELECT name, inode FROM jfs_edge WHERE parent = ?1 ORDER BY name")?;
+        let rows = stmt.query_map(params![src_ino.as_u64() as i64], |r| {
+            let nb: Vec<u8> = r.get(0)?;
+            let child_ino: i64 = r.get(1)?;
+            Ok((
+                String::from_utf8_lossy(&nb).into_owned(),
+                Ino(child_ino as u64),
+            ))
+        })?;
+        let mut children = Vec::new();
+        for row in rows {
+            children.push(row?);
+        }
+        drop(stmt);
+
+        for (cname, cino) in children {
+            clone_node_recursive(tx, cino, new_ino, &cname, now)?;
+        }
+    }
+
+    copy_xattrs(tx, src_ino, new_ino)?;
+
+    Ok((new_ino, attr))
+}
+
+fn copy_xattrs(tx: &Transaction<'_>, src_ino: Ino, dst_ino: Ino) -> Result<(), MetaError> {
+    let mut xstmt = tx.prepare("SELECT name, value FROM jfs_xattr WHERE inode = ?1")?;
+    let xrows = xstmt.query_map(params![src_ino.as_u64() as i64], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut xattrs = Vec::new();
+    for row in xrows {
+        xattrs.push(row?);
+    }
+    drop(xstmt);
+    for (xname, xval) in xattrs {
+        tx.execute(
+            "INSERT INTO jfs_xattr (inode, name, value) VALUES (?1, ?2, ?3)",
+            params![dst_ino.as_u64() as i64, xname, xval],
+        )?;
+    }
+    Ok(())
 }
 
 fn fsck_sync(conn: &Connection) -> Result<FsckReport, MetaError> {

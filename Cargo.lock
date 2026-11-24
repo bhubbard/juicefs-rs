@@ -1006,6 +1006,7 @@ name = "juicefs-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "juicefs-core",
  "juicefs-gateway",
@@ -1013,6 +1014,7 @@ dependencies = [
  "juicefs-object",
  "juicefs-sync",
  "juicefs-vfs",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing-subscriber",

@@ -274,6 +274,18 @@ pub trait Meta: Send + Sync + std::fmt::Debug {
         old_count: usize,
         new_slice: Slice,
     ) -> Result<(), MetaError>;
+
+    /// Updates the persisted volume [`Format`] in metadata.
+    async fn update_format(&self, format: &Format) -> Result<(), MetaError>;
+
+    /// Zero-copy clones a file or directory tree from `src_parent/src_name` to `dst_parent/dst_name`.
+    async fn clone_entry(
+        &self,
+        src_parent: Ino,
+        src_name: &str,
+        dst_parent: Ino,
+        dst_name: &str,
+    ) -> Result<(Ino, Attr), MetaError>;
 }
 
 /// Opens a metadata engine from a `JuiceFS` metadata URL (e.g. `sqlite3:///path/to/db`).

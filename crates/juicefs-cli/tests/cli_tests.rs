@@ -72,7 +72,31 @@ fn cli_full_volume_lifecycle() {
     run(&["dump", &meta, "-o", dump_file.to_str().unwrap()]);
     assert!(dump_file.exists());
 
+    // Phase 1 commands: info, summary, clone, warmup, config, bench, objbench
+    let info_out = run(&["info", &meta, "/work/sub/test.txt"]);
+    assert!(info_out.contains("chunk[0]"));
+
+    let sum_out = run(&["summary", &meta, "/work"]);
+    assert!(sum_out.contains("Files: 1"));
+
+    run(&["clone", &meta, "/work", "/work_clone"]);
+    assert_eq!(
+        run(&["cat", &meta, "/work_clone/sub/test.txt"]),
+        "juicefs-cli-integration"
+    );
+
+    let warmup_out = run(&["warmup", &meta, "/work_clone"]);
+    assert!(warmup_out.contains("Warmed up 1 file(s)"));
+
+    run(&["config", &meta, "--trash-days", "7"]);
+    let cfg_out = run(&["config", &meta]);
+    assert!(cfg_out.contains("\"TrashDays\": 7"));
+
+    run(&["bench", &meta, "/.bench_tmp", "--size-mb", "1"]);
+    run(&["objbench", "mem://", "--size-mb", "1"]);
+
     run(&["rm", "-r", &meta, "/work"]);
+    run(&["rm", "-r", &meta, "/work_clone"]);
     run(&["gc", &meta]);
 }
 
