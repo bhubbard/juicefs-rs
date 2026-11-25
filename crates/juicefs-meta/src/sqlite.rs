@@ -158,7 +158,18 @@ impl SqliteMeta {
              PRAGMA synchronous = NORMAL;
              PRAGMA busy_timeout = 5000;",
         )?;
-        conn.execute_batch(SCHEMA_SQL)?;
+        let has_schema: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jfs_session2' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if has_schema.is_none() {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(SCHEMA_SQL)?;
+            tx.commit()?;
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
