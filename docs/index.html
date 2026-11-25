@@ -132,7 +132,7 @@
       <div class="stat"><div class="val">93</div><div class="lbl">Passing Tests (0 Failed)</div></div>
       <div class="stat"><div class="val">82.96%</div><div class="lbl">Line Coverage (llvm-cov)</div></div>
       <div class="stat"><div class="val">988.9 MiB/s</div><div class="lbl">moka-Cached VFS Read</div></div>
-      <div class="stat"><div class="val">1.9×–2.1×</div><div class="lbl">Faster sync / status / fsck vs Go</div></div>
+      <div class="stat"><div class="val">2.1×–2.2×</div><div class="lbl">Faster format / status / fsck / sync vs Go</div></div>
     </section>
 
     <h2 id="benchmarks">Benchmarks (Apple Silicon, <code>--release</code> vs Go JuiceFS 1.4.2)</h2>
@@ -141,12 +141,12 @@
         <tr><th>Operation</th><th>juicefs-rs</th><th>juicefs-go</th><th>Comparison</th></tr>
       </thead>
       <tbody>
-        <tr><td><code>status</code></td><td class="win">0.037 s</td><td>0.077 s</td><td class="win">2.1× faster</td></tr>
-        <tr><td><code>fsck</code></td><td class="win">0.036 s</td><td>0.076 s</td><td class="win">2.1× faster</td></tr>
-        <tr><td><code>sync</code> (100 × 128 KiB, 8 threads)</td><td class="win">0.045 s</td><td>0.086 s</td><td class="win">1.9× faster</td></tr>
-        <tr><td><code>format</code> (sqlite3 + file + lz4)</td><td>0.379 s</td><td class="win">0.306 s</td><td>Rust enables SQLite WAL mode</td></tr>
-        <tr><td><code>vfs put 16 MiB</code></td><td>0.078 s (~205 MiB/s)</td><td>—</td><td>End-to-end CLI upload</td></tr>
-        <tr><td><code>vfs get 16 MiB</code></td><td>0.048 s (~333 MiB/s)</td><td>—</td><td>End-to-end CLI download</td></tr>
+        <tr><td><code>format</code> (sqlite3 + file + lz4)</td><td class="win">0.038 s</td><td>0.083 s</td><td class="win">2.2× faster</td></tr>
+        <tr><td><code>status</code></td><td class="win">0.037 s</td><td>0.078 s</td><td class="win">2.1× faster</td></tr>
+        <tr><td><code>fsck</code></td><td class="win">0.036 s</td><td>0.075 s</td><td class="win">2.1× faster</td></tr>
+        <tr><td><code>sync</code> (100 × 128 KiB, 8 threads)</td><td class="win">0.046 s</td><td>0.095 s</td><td class="win">2.1× faster</td></tr>
+        <tr><td><code>vfs put 16 MiB</code></td><td>0.075 s (~213 MiB/s)</td><td>—</td><td>End-to-end CLI upload</td></tr>
+        <tr><td><code>vfs get 16 MiB</code></td><td>0.054 s (~296 MiB/s)</td><td>—</td><td>End-to-end CLI download</td></tr>
       </tbody>
     </table>
 

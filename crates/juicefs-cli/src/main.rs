@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use juicefs_core::{ChunkConfig, ClientConfig, Format, NodeType};
 use juicefs_gateway::GatewayServer;
-use juicefs_meta::{Meta, open_any_meta, open_meta};
+use juicefs_meta::{Meta, SqliteMeta, open_any_meta, open_meta};
 use juicefs_object::{FileStore, MemoryStore, ObjectStorage, S3Store};
 use juicefs_sync::{SyncConfig, sync_objects};
 use juicefs_vfs::Vfs;
@@ -367,10 +367,21 @@ fn open_sync_store(uri: &str) -> Result<Arc<dyn ObjectStorage>> {
 }
 
 async fn cmd_format(meta_url: &str, format: &Format, force: bool) -> Result<()> {
-    let meta = open_meta(meta_url).context("opening metadata store")?;
-    meta.init(format, force)
-        .await
-        .context("formatting volume")?;
+    if let Some(rest) = meta_url.strip_prefix("sqlite3://") {
+        let path = if rest == ":memory:" || rest.is_empty() {
+            ":memory:"
+        } else {
+            rest
+        };
+        SqliteMeta::open_and_init(path, format, force).context("formatting volume")?;
+    } else {
+        let meta = open_any_meta(meta_url)
+            .await
+            .context("opening metadata store")?;
+        meta.init(format, force)
+            .await
+            .context("formatting volume")?;
+    }
     println!("Formatted volume '{}' (UUID: {})", format.name, format.uuid);
     Ok(())
 }

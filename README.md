@@ -47,12 +47,12 @@ Measured on Apple Silicon (macOS, `--release` profile) against `/opt/homebrew/bi
 
 | Operation | `juicefs-rs` | `juicefs-go` | Notes |
 |---|---:|---:|---|
-| `format` (`sqlite3` + `file` + `lz4`) | 0.379 s | **0.306 s** | `juicefs-rs` enables SQLite `WAL` mode on creation |
-| `status` | **0.037 s** | 0.077 s | **2.1× faster** |
-| `fsck` | **0.036 s** | 0.076 s | **2.1× faster** |
-| `sync` (`100 × 128 KiB`, `--threads 8`) | **0.045 s** | 0.086 s | **1.9× faster** |
-| `vfs put 16 MiB` | **0.078 s** (~205 MiB/s) | — | End-to-end CLI upload |
-| `vfs get 16 MiB` | **0.048 s** (~333 MiB/s) | — | End-to-end CLI download |
+| `format` (`sqlite3` + `file` + `lz4`) | **0.038 s** | 0.083 s | **2.2× faster** (single-tx schema + init) |
+| `status` | **0.037 s** | 0.078 s | **2.1× faster** |
+| `fsck` | **0.036 s** | 0.075 s | **2.1× faster** |
+| `sync` (`100 × 128 KiB`, `--threads 8`) | **0.046 s** | 0.095 s | **2.1× faster** |
+| `vfs put 16 MiB` | **0.075 s** (~213 MiB/s) | — | End-to-end CLI upload |
+| `vfs get 16 MiB` | **0.054 s** (~296 MiB/s) | — | End-to-end CLI download |
 
 ### Criterion Microbenchmarks (`cargo bench -p juicefs-vfs --bench vfs_bench`)
 

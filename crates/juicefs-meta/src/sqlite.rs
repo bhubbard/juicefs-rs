@@ -154,8 +154,8 @@ impl SqliteMeta {
         }
         let conn = Connection::open(path_ref)?;
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
+            "PRAGMA synchronous = NORMAL;
+             PRAGMA journal_mode = WAL;
              PRAGMA busy_timeout = 5000;",
         )?;
         let has_schema: Option<i64> = conn
@@ -170,6 +170,37 @@ impl SqliteMeta {
             tx.execute_batch(SCHEMA_SQL)?;
             tx.commit()?;
         }
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Opens a SQLite metadata database and formats it in a single transaction.
+    pub fn open_and_init(
+        path: impl AsRef<Path>,
+        format: &Format,
+        force: bool,
+    ) -> Result<Self, MetaError> {
+        let path_ref = path.as_ref();
+        if path_ref != Path::new(":memory:")
+            && let Some(parent) = path_ref.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| MetaError::InvalidInput(format!("cannot create meta dir: {e}")))?;
+        }
+        let mut conn = Connection::open(path_ref)?;
+        conn.execute_batch(
+            "PRAGMA synchronous = NORMAL;
+             PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        let format_json = serde_json::to_string(format)?;
+        let create_trash = format.trash_days > 0;
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_SQL)?;
+        init_in_tx(&tx, &format_json, create_trash, force)?;
+        tx.commit()?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -915,6 +946,74 @@ fn remove_existing_dst(
     Ok(())
 }
 
+fn init_in_tx(
+    tx: &Transaction<'_>,
+    format_json: &str,
+    create_trash: bool,
+    force: bool,
+) -> Result<(), MetaError> {
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT value FROM jfs_setting WHERE name = 'format'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if existing.is_some() && !force {
+        return Err(MetaError::AlreadyExists(
+            "volume already formatted".to_owned(),
+        ));
+    }
+    if force {
+        tx.execute_batch(
+            "DELETE FROM jfs_setting;
+             DELETE FROM jfs_counter;
+             DELETE FROM jfs_edge;
+             DELETE FROM jfs_node;
+             DELETE FROM jfs_chunk;
+             DELETE FROM jfs_slice_ref;
+             DELETE FROM jfs_symlink;
+             DELETE FROM jfs_xattr;
+             DELETE FROM jfs_flock;
+             DELETE FROM jfs_plock;
+             DELETE FROM jfs_dir_quota;
+             DELETE FROM jfs_dirstats;
+             DELETE FROM jfs_ug_quota;
+             DELETE FROM jfs_changelog;
+             DELETE FROM jfs_session2;",
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO jfs_setting (name, value) VALUES ('format', ?1)",
+        params![format_json],
+    )?;
+    tx.execute(
+        "INSERT INTO jfs_counter (name, value) VALUES ('nextInode', 1), ('nextChunk', 0), ('usedSpace', 0), ('usedInodes', 1)",
+        [],
+    )?;
+    let now = now_ns();
+    let sec = now / 1_000_000_000;
+    let nsec = (now % 1_000_000_000) as u32;
+    let root = Attr {
+        typ: NodeType::Directory,
+        mode: 0o777,
+        nlink: 2,
+        atime: sec,
+        mtime: sec,
+        ctime: sec,
+        atime_nsec: nsec,
+        mtime_nsec: nsec,
+        ctime_nsec: nsec,
+        parent: ROOT_INODE,
+        ..Attr::default()
+    };
+    insert_node(tx, ROOT_INODE, &root)?;
+    if create_trash {
+        ensure_trash_node(tx, now)?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Meta for SqliteMeta {
     async fn init(&self, format: &Format, force: bool) -> Result<(), MetaError> {
@@ -922,63 +1021,7 @@ impl Meta for SqliteMeta {
         let create_trash = format.trash_days > 0;
         self.run(move |conn| {
             let tx = conn.transaction()?;
-            let existing: Option<String> = tx
-                .query_row(
-                    "SELECT value FROM jfs_setting WHERE name = 'format'",
-                    [],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if existing.is_some() && !force {
-                return Err(MetaError::AlreadyExists("volume already formatted".to_owned()));
-            }
-            if force {
-                tx.execute_batch(
-                    "DELETE FROM jfs_setting;
-                     DELETE FROM jfs_counter;
-                     DELETE FROM jfs_edge;
-                     DELETE FROM jfs_node;
-                     DELETE FROM jfs_chunk;
-                     DELETE FROM jfs_slice_ref;
-                     DELETE FROM jfs_symlink;
-                     DELETE FROM jfs_xattr;
-                     DELETE FROM jfs_flock;
-                     DELETE FROM jfs_plock;
-                     DELETE FROM jfs_dir_quota;
-                     DELETE FROM jfs_dirstats;
-                     DELETE FROM jfs_ug_quota;
-                     DELETE FROM jfs_changelog;
-                     DELETE FROM jfs_session2;",
-                )?;
-            }
-            tx.execute(
-                "INSERT INTO jfs_setting (name, value) VALUES ('format', ?1)",
-                params![format_json],
-            )?;
-            tx.execute(
-                "INSERT INTO jfs_counter (name, value) VALUES ('nextInode', 1), ('nextChunk', 0), ('usedSpace', 0), ('usedInodes', 1)",
-                [],
-            )?;
-            let now = now_ns();
-            let sec = now / 1_000_000_000;
-            let nsec = (now % 1_000_000_000) as u32;
-            let root = Attr {
-                typ: NodeType::Directory,
-                mode: 0o777,
-                nlink: 2,
-                atime: sec,
-                mtime: sec,
-                ctime: sec,
-                atime_nsec: nsec,
-                mtime_nsec: nsec,
-                ctime_nsec: nsec,
-                parent: ROOT_INODE,
-                ..Attr::default()
-            };
-            insert_node(&tx, ROOT_INODE, &root)?;
-            if create_trash {
-                ensure_trash_node(&tx, now)?;
-            }
+            init_in_tx(&tx, &format_json, create_trash, force)?;
             tx.commit()?;
             Ok(())
         })

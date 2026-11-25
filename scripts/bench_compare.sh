@@ -34,6 +34,7 @@ run_common_bench() {
 
   echo ""
   echo "=== $label ==="
+  "$bin" --version >/dev/null 2>&1 || true
   local t0 t1
   t0=$(now_sec)
   "$bin" format "$meta" "benchvol" --storage file --bucket "$sub/data" --compress lz4 >/dev/null 2>&1
