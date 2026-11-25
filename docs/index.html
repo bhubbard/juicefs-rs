@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>juicefs-rs — Pure-Rust JuiceFS Implementation</title>
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --surface: #131a26;
+      --border: #243045;
+      --text: #e6edf7;
+      --muted: #93a4bd;
+      --accent: #f97316;
+      --accent-soft: rgba(249, 115, 22, 0.14);
+      --green: #22c55e;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    .container { max-width: 1020px; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+    header {
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 2rem;
+      margin-bottom: 2.5rem;
+    }
+    .badge {
+      display: inline-block;
+      background: var(--accent-soft);
+      color: var(--accent);
+      border: 1px solid rgba(249, 115, 22, 0.35);
+      border-radius: 999px;
+      padding: 0.2rem 0.75rem;
+      font-size: 0.82rem;
+      font-weight: 600;
+      margin-bottom: 0.75rem;
+    }
+    h1 { font-size: 2.4rem; margin: 0.25rem 0 0.75rem; letter-spacing: -0.02em; }
+    .lead { color: var(--muted); font-size: 1.1rem; max-width: 720px; margin: 0 0 1.25rem; }
+    .actions { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+    .btn {
+      display: inline-block;
+      padding: 0.55rem 1rem;
+      border-radius: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 0.92rem;
+      border: 1px solid var(--border);
+      color: var(--text);
+      background: var(--surface);
+    }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #0b0f17; }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 1rem;
+      margin: 2rem 0;
+    }
+    .stat {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.15rem;
+    }
+    .stat .val { font-size: 1.6rem; font-weight: 700; color: var(--green); }
+    .stat .lbl { font-size: 0.85rem; color: var(--muted); }
+    h2 { font-size: 1.45rem; margin: 2.5rem 0 1rem; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      font-size: 0.94rem;
+    }
+    th, td { padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--border); text-align: left; }
+    th { background: rgba(255, 255, 255, 0.03); color: var(--muted); font-weight: 600; }
+    tr:last-child td { border-bottom: none; }
+    .win { color: var(--green); font-weight: 600; }
+    pre {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.2rem;
+      overflow-x: auto;
+      font-family: var(--mono);
+      font-size: 0.86rem;
+    }
+    code { font-family: var(--mono); font-size: 0.88em; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1rem;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.15rem;
+    }
+    .card h3 { margin: 0 0 0.35rem; font-size: 1rem; color: var(--accent); font-family: var(--mono); }
+    .card p { margin: 0; font-size: 0.9rem; color: var(--muted); }
+    footer { margin-top: 3.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="badge">Apache-2.0 · Pure Rust · 11 Crates</div>
+      <h1>juicefs-rs</h1>
+      <p class="lead">
+        A pure-Rust port of the JuiceFS distributed POSIX filesystem architecture — zero Go runtime,
+        zero C/<code>libfuse</code> build dependencies, native macOS &amp; Linux support.
+      </p>
+      <div class="actions">
+        <a class="btn primary" href="https://github.com/bhubbard/juicefs-rs">View on GitHub</a>
+        <a class="btn" href="#benchmarks">Benchmarks</a>
+        <a class="btn" href="#crates">Architecture</a>
+        <a class="btn" href="#quickstart">Quickstart</a>
+      </div>
+    </header>
+
+    <section class="stats">
+      <div class="stat"><div class="val">93</div><div class="lbl">Passing Tests (0 Failed)</div></div>
+      <div class="stat"><div class="val">82.96%</div><div class="lbl">Line Coverage (llvm-cov)</div></div>
+      <div class="stat"><div class="val">988.9 MiB/s</div><div class="lbl">moka-Cached VFS Read</div></div>
+      <div class="stat"><div class="val">1.9×–2.1×</div><div class="lbl">Faster sync / status / fsck vs Go</div></div>
+    </section>
+
+    <h2 id="benchmarks">Benchmarks (Apple Silicon, <code>--release</code> vs Go JuiceFS 1.4.2)</h2>
+    <table>
+      <thead>
+        <tr><th>Operation</th><th>juicefs-rs</th><th>juicefs-go</th><th>Comparison</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>status</code></td><td class="win">0.037 s</td><td>0.077 s</td><td class="win">2.1× faster</td></tr>
+        <tr><td><code>fsck</code></td><td class="win">0.036 s</td><td>0.076 s</td><td class="win">2.1× faster</td></tr>
+        <tr><td><code>sync</code> (100 × 128 KiB, 8 threads)</td><td class="win">0.045 s</td><td>0.086 s</td><td class="win">1.9× faster</td></tr>
+        <tr><td><code>format</code> (sqlite3 + file + lz4)</td><td>0.379 s</td><td class="win">0.306 s</td><td>Rust enables SQLite WAL mode</td></tr>
+        <tr><td><code>vfs put 16 MiB</code></td><td>0.078 s (~205 MiB/s)</td><td>—</td><td>End-to-end CLI upload</td></tr>
+        <tr><td><code>vfs get 16 MiB</code></td><td>0.048 s (~333 MiB/s)</td><td>—</td><td>End-to-end CLI download</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Criterion Microbenchmarks</h2>
+    <table>
+      <thead>
+        <tr><th>Benchmark</th><th>Mean Time</th><th>Throughput</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>compression_1mb/compress/lz4</code></td><td>58.96 µs</td><td>16.57 GiB/s</td></tr>
+        <tr><td><code>compression_1mb/decompress/lz4</code></td><td>30.23 µs</td><td>32.31 GiB/s</td></tr>
+        <tr><td><code>compression_1mb/compress/zstd</code></td><td>107.75 µs</td><td>9.06 GiB/s</td></tr>
+        <tr><td><code>compression_1mb/decompress/zstd</code></td><td>35.40 µs</td><td>27.59 GiB/s</td></tr>
+        <tr><td><code>vfs_io/read_64k_file_cached</code> (<code>moka</code>)</td><td>63.20 µs</td><td class="win">988.90 MiB/s</td></tr>
+        <tr><td><code>build_slice_100_overlapping</code></td><td>7.76 µs</td><td>—</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="crates">Workspace Crates</h2>
+    <div class="grid">
+      <div class="card"><h3>juicefs-core</h3><p>POSIX domain types, 24-byte big-endian slice wire format, interval tree resolution, LZ4/Zstd compression.</p></div>
+      <div class="card"><h3>juicefs-object</h3><p>Memory, File, S3/OSS/COS/MinIO/B2, GCS, Azure, Prefixed, AES-256-GCM &amp; 64 KiB chunked AEAD encryption, FNV-1a sharding, multipart, restore.</p></div>
+      <div class="card"><h3>juicefs-chunk</h3><p>moka concurrent cache, DiskBlockCache (2-Random/LRU), SingleFlight deduplication, Prefetcher, TokenBucket rate limits, async WritebackQueue.</p></div>
+      <div class="card"><h3>juicefs-meta</h3><p>SqliteMeta (WAL) &amp; feature-gated RedisMeta: POSIX tree, flock/plock, dir &amp; user/group quotas, .trash, dirStats, changelog, sessions, clone, dump/load, fsck.</p></div>
+      <div class="card"><h3>juicefs-vfs</h3><p>Multi-chunk I/O, sparse holes, POSIX access/ACLs, .stats/.config virtual files, compact_file, symlink loop guard, summary, warmup, tier.</p></div>
+      <div class="card"><h3>juicefs-fuse</h3><p>Pure-Rust POSIX FUSE adapter, file-handle table, MountConfig, and cross-platform unmount helper.</p></div>
+      <div class="card"><h3>juicefs-sync</h3><p>Concurrent Semaphore-bounded object sync engine with update, delete-dst, prefix, and dry-run modes.</p></div>
+      <div class="card"><h3>juicefs-gateway</h3><p>S3-compatible HTTP gateway over Vfs (ListObjectsV2 XML, GET/Range, HEAD, PUT, DELETE).</p></div>
+      <div class="card"><h3>juicefs-webdav</h3><p>WebDAV HTTP server over Vfs (OPTIONS, PROPFIND, GET/Range, HEAD, PUT, MKCOL, DELETE, MOVE, COPY, /metrics).</p></div>
+      <div class="card"><h3>juicefs-metric</h3><p>Lock-free atomic counters and Prometheus/OpenMetrics text exposition.</p></div>
+      <div class="card"><h3>juicefs-cli</h3><p>Full <code>juicefs</code> binary wiring 30+ subcommands for admin, I/O, sync, gateway, webdav, and benchmarks.</p></div>
+    </div>
+
+    <h2 id="quickstart">Quickstart</h2>
+    <pre><code>cargo build --release -p juicefs-cli
+./target/release/juicefs format sqlite3:///tmp/jfs.db myvol --storage file --bucket /tmp/jfs-data --compress zstd
+./target/release/juicefs mkdir -p sqlite3:///tmp/jfs.db /docs
+./target/release/juicefs put sqlite3:///tmp/jfs.db ./Cargo.toml /docs/Cargo.toml
+./target/release/juicefs cat sqlite3:///tmp/jfs.db /docs/Cargo.toml</code></pre>
+
+    <footer>
+      Built in Rust · <a href="https://github.com/bhubbard/juicefs-rs" style="color: var(--accent);">github.com/bhubbard/juicefs-rs</a>
+    </footer>
+  </div>
+</body>
+</html>
