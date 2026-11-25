@@ -2,6 +2,7 @@
 
 pub mod cloud;
 pub mod encrypt;
+pub mod encrypt_chunked;
 pub mod error;
 pub mod file;
 pub mod memory;
@@ -19,6 +20,7 @@ use juicefs_core::Format;
 
 pub use cloud::{AzureStore, GcsStore};
 pub use encrypt::EncryptedStore;
+pub use encrypt_chunked::{CHUNK_SIZE, ChunkedCipher, ChunkedEncryptedStore};
 pub use error::ObjectError;
 pub use file::FileStore;
 pub use memory::MemoryStore;
@@ -145,6 +147,11 @@ pub trait ObjectStorage: Send + Sync + std::fmt::Debug {
         Err(ObjectError::Unsupported(
             "multipart upload is not supported".to_owned(),
         ))
+    }
+
+    /// Restores an archived object so it becomes readable for `days` days.
+    async fn restore(&self, _key: &str, _days: i32) -> Result<(), ObjectError> {
+        Err(ObjectError::Unsupported("restore".to_owned()))
     }
 }
 

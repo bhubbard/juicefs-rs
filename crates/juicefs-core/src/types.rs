@@ -232,6 +232,8 @@ impl SetAttrFlags {
     pub const MTIME_NOW: Self = Self(1 << 8);
     /// Set `ctime` to current time.
     pub const CTIME_NOW: Self = Self(1 << 9);
+    /// Update storage `tier`.
+    pub const TIER: Self = Self(1 << 10);
 
     /// Combines two flag sets.
     #[must_use]

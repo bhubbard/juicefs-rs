@@ -268,4 +268,9 @@ impl ObjectStorage for MemoryStore {
         }
         Ok(())
     }
+
+    async fn restore(&self, key: &str, _days: i32) -> Result<(), ObjectError> {
+        validate_key(key)?;
+        Ok(())
+    }
 }

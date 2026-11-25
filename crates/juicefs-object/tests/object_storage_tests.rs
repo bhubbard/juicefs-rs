@@ -1,13 +1,18 @@
 //! Ported tests from `pkg/object/object_storage_test.go`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use juicefs_core::Format;
+use juicefs_object::encrypt_chunked::HEADER_SIZE;
 use juicefs_object::{
-    AzureStore, EncryptedStore, FileStore, GcsStore, MemoryStore, ObjectError, ObjectStorage, Part,
-    PrefixedStore, S3Store, ShardedStore, open_from_format,
+    AzureStore, CHUNK_SIZE, ChunkedCipher, ChunkedEncryptedStore, EncryptedStore, FileStore,
+    GcsStore, MemoryStore, ObjectError, ObjectMeta, ObjectStorage, Part, PrefixedStore, S3Store,
+    ShardedStore, open_from_format,
 };
+use parking_lot::Mutex;
 use tempfile::tempdir;
 
 async fn run_object_storage_suite(store: &dyn ObjectStorage) {
@@ -692,5 +697,583 @@ fn test_open_from_format_cloud_dispatch() {
     assert!(matches!(
         open_from_format(&unsupported),
         Err(ObjectError::UnsupportedBackend(name)) if name == "swift"
+    ));
+}
+
+#[derive(Debug)]
+struct DefaultRestoreStore;
+
+#[async_trait]
+impl ObjectStorage for DefaultRestoreStore {
+    fn description(&self) -> String {
+        "default://".to_owned()
+    }
+
+    async fn create(&self) -> Result<(), ObjectError> {
+        Ok(())
+    }
+
+    async fn get(&self, key: &str, _offset: u64, _limit: usize) -> Result<Bytes, ObjectError> {
+        Err(ObjectError::NotFound(key.to_owned()))
+    }
+
+    async fn put(&self, _key: &str, _data: Bytes) -> Result<(), ObjectError> {
+        Ok(())
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectError> {
+        Err(ObjectError::NotFound(key.to_owned()))
+    }
+
+    async fn delete(&self, _key: &str) -> Result<(), ObjectError> {
+        Ok(())
+    }
+
+    async fn copy(&self, _dst: &str, _src: &str) -> Result<(), ObjectError> {
+        Ok(())
+    }
+
+    async fn list(&self, _prefix: &str) -> Result<Vec<ObjectMeta>, ObjectError> {
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Debug)]
+struct RecordingStore {
+    inner: Arc<dyn ObjectStorage>,
+    gets: Mutex<Vec<(u64, usize)>>,
+    bytes_read: AtomicUsize,
+}
+
+impl RecordingStore {
+    fn new(inner: Arc<dyn ObjectStorage>) -> Self {
+        Self {
+            inner,
+            gets: Mutex::new(Vec::new()),
+            bytes_read: AtomicUsize::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.gets.lock().clear();
+        self.bytes_read.store(0, Ordering::Relaxed);
+    }
+
+    fn recorded_gets(&self) -> Vec<(u64, usize)> {
+        self.gets.lock().clone()
+    }
+
+    fn total_bytes_read(&self) -> usize {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl ObjectStorage for RecordingStore {
+    fn description(&self) -> String {
+        self.inner.description()
+    }
+
+    async fn create(&self) -> Result<(), ObjectError> {
+        self.inner.create().await
+    }
+
+    async fn get(&self, key: &str, offset: u64, limit: usize) -> Result<Bytes, ObjectError> {
+        self.gets.lock().push((offset, limit));
+        let data = self.inner.get(key, offset, limit).await?;
+        self.bytes_read.fetch_add(data.len(), Ordering::Relaxed);
+        Ok(data)
+    }
+
+    async fn put(&self, key: &str, data: Bytes) -> Result<(), ObjectError> {
+        self.inner.put(key, data).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectError> {
+        self.inner.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ObjectError> {
+        self.inner.delete(key).await
+    }
+
+    async fn copy(&self, dst: &str, src: &str) -> Result<(), ObjectError> {
+        self.inner.copy(dst, src).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectError> {
+        self.inner.list(prefix).await
+    }
+
+    async fn restore(&self, key: &str, days: i32) -> Result<(), ObjectError> {
+        self.inner.restore(key, days).await
+    }
+}
+
+#[tokio::test]
+async fn test_restore_across_stores() {
+    // Default trait implementation returns Unsupported("restore").
+    let default_store = DefaultRestoreStore;
+    assert!(matches!(
+        default_store.restore("any", 7).await,
+        Err(ObjectError::Unsupported(op)) if op == "restore"
+    ));
+
+    // MemoryStore: no-op Ok(()) for valid keys, InvalidKey for bad keys.
+    let mem = MemoryStore::new();
+    mem.restore("missing-or-present", 3)
+        .await
+        .expect("memory restore");
+    assert!(matches!(
+        mem.restore("../bad", 3).await,
+        Err(ObjectError::InvalidKey(_))
+    ));
+
+    // FileStore: Ok(()) if exists, NotFound otherwise.
+    let dir = tempdir().expect("tempdir");
+    let file_store = Arc::new(FileStore::new(dir.path()).expect("file store"));
+    file_store.create().await.expect("create file store");
+    assert!(matches!(
+        file_store.restore("archive/obj.bin", 5).await,
+        Err(ObjectError::NotFound(_))
+    ));
+    file_store
+        .put("archive/obj.bin", Bytes::from_static(b"archived-data"))
+        .await
+        .expect("put file");
+    file_store
+        .restore("archive/obj.bin", 5)
+        .await
+        .expect("restore existing file");
+
+    // PrefixedStore delegates with full key.
+    let prefixed = PrefixedStore::new(file_store.clone(), "tenant-a");
+    assert!(matches!(
+        prefixed.restore("item.bin", 7).await,
+        Err(ObjectError::NotFound(_))
+    ));
+    file_store
+        .put("tenant-a/item.bin", Bytes::from_static(b"prefixed-data"))
+        .await
+        .expect("put full key");
+    prefixed
+        .restore("item.bin", 7)
+        .await
+        .expect("restore through prefix");
+
+    // EncryptedStore, ChunkedEncryptedStore, and ShardedStore delegate restore.
+    let encrypted = EncryptedStore::new(file_store.clone(), [0x55u8; 32]);
+    encrypted
+        .restore("archive/obj.bin", 2)
+        .await
+        .expect("restore through encrypted");
+    assert!(matches!(
+        encrypted.restore("archive/missing.bin", 2).await,
+        Err(ObjectError::NotFound(_))
+    ));
+
+    let chunked = ChunkedEncryptedStore::new(
+        file_store.clone(),
+        ChunkedCipher::ChaCha20Poly1305,
+        [0x66u8; 32],
+    );
+    chunked
+        .restore("archive/obj.bin", 2)
+        .await
+        .expect("restore through chunked encrypted");
+    assert!(matches!(
+        chunked.restore("archive/missing.bin", 2).await,
+        Err(ObjectError::NotFound(_))
+    ));
+
+    let dir2 = tempdir().expect("tempdir2");
+    let shard2 = Arc::new(FileStore::new(dir2.path()).expect("shard2"));
+    let sharded = ShardedStore::new(vec![file_store, shard2]).expect("sharded");
+    sharded
+        .put("sharded/obj.bin", Bytes::from_static(b"sharded"))
+        .await
+        .expect("put sharded");
+    sharded
+        .restore("sharded/obj.bin", 10)
+        .await
+        .expect("restore sharded");
+    assert!(matches!(
+        sharded.restore("sharded/missing.bin", 10).await,
+        Err(ObjectError::NotFound(_))
+    ));
+}
+
+fn deterministic_payload(len: usize) -> Bytes {
+    let data: Vec<u8> = (0..len)
+        .map(|i| ((i.wrapping_mul(31) ^ (i >> 7)) & 0xFF) as u8)
+        .collect();
+    Bytes::from(data)
+}
+
+async fn verify_chunked_range_reads(
+    store: &ChunkedEncryptedStore,
+    recorder: &RecordingStore,
+    key_name: &str,
+    payload: &Bytes,
+) {
+    let payload_len = payload.len();
+
+    // Range read strictly inside chunk 1 only fetches header + chunk 1.
+    recorder.reset();
+    let mid_off = (CHUNK_SIZE + 512) as u64;
+    let mid_len = 1024usize;
+    let mid = store
+        .get(key_name, mid_off, mid_len)
+        .await
+        .expect("get inside chunk 1");
+    assert_eq!(
+        &mid[..],
+        &payload[mid_off as usize..mid_off as usize + mid_len]
+    );
+    let gets = recorder.recorded_gets();
+    assert_eq!(gets.len(), 2, "expected header + single chunk fetch");
+    assert_eq!(gets[0], (0, HEADER_SIZE));
+    assert_eq!(
+        gets[1],
+        ((HEADER_SIZE + CHUNK_SIZE + 28) as u64, CHUNK_SIZE + 28)
+    );
+    assert_eq!(recorder.total_bytes_read(), HEADER_SIZE + CHUNK_SIZE + 28);
+
+    // Range read spanning chunk 0 -> chunk 1 boundary.
+    recorder.reset();
+    let b0_off = (CHUNK_SIZE - 128) as u64;
+    let b0_len = 256usize;
+    let b0 = store
+        .get(key_name, b0_off, b0_len)
+        .await
+        .expect("boundary 0->1");
+    assert_eq!(&b0[..], &payload[b0_off as usize..b0_off as usize + b0_len]);
+    assert_eq!(recorder.recorded_gets().len(), 2);
+    assert_eq!(
+        recorder.total_bytes_read(),
+        HEADER_SIZE + 2 * (CHUNK_SIZE + 28)
+    );
+
+    // Range read spanning chunk 1 -> chunk 2 (partial final chunk) boundary.
+    let b1_off = (2 * CHUNK_SIZE - 64) as u64;
+    let b1_len = 300usize;
+    let b1 = store
+        .get(key_name, b1_off, b1_len)
+        .await
+        .expect("boundary 1->2");
+    assert_eq!(&b1[..], &payload[b1_off as usize..b1_off as usize + b1_len]);
+
+    // Range read spanning all 3 chunks.
+    let span_off = (CHUNK_SIZE - 17) as u64;
+    let span_len = CHUNK_SIZE + 500;
+    let span = store
+        .get(key_name, span_off, span_len)
+        .await
+        .expect("span all chunks");
+    assert_eq!(
+        &span[..],
+        &payload[span_off as usize..span_off as usize + span_len]
+    );
+
+    // Tail read (limit == 0) starting in chunk 2 skips chunks 0 and 1.
+    recorder.reset();
+    let tail_off = (2 * CHUNK_SIZE + 100) as u64;
+    let tail = store.get(key_name, tail_off, 0).await.expect("tail");
+    assert_eq!(&tail[..], &payload[tail_off as usize..]);
+    let last_chunk_enc_len = (payload_len - 2 * CHUNK_SIZE) + 28;
+    assert_eq!(
+        recorder.total_bytes_read(),
+        HEADER_SIZE + last_chunk_enc_len
+    );
+
+    // Exact EOF and out-of-bounds range checks.
+    assert_eq!(
+        store
+            .get(key_name, payload_len as u64, 16)
+            .await
+            .expect("eof"),
+        Bytes::new()
+    );
+    assert!(matches!(
+        store.get(key_name, payload_len as u64 + 1, 16).await,
+        Err(ObjectError::InvalidRange { .. })
+    ));
+}
+
+async fn verify_chunked_isolation_and_edge_cases(
+    store: &ChunkedEncryptedStore,
+    mem: &MemoryStore,
+    key_name: &str,
+    payload: &Bytes,
+    raw: &Bytes,
+) {
+    let mid_off = (CHUNK_SIZE + 512) as u64;
+    let mid_len = 1024usize;
+
+    // Corrupt chunk 0 and chunk 2 in the underlying store: reading chunk 1 STILL
+    // succeeds, proving untouched chunks are neither fetched nor decrypted.
+    let mut corrupted = raw.to_vec();
+    corrupted[HEADER_SIZE + 20] ^= 0xFF; // inside chunk 0
+    let last_idx = corrupted.len() - 1;
+    corrupted[last_idx] ^= 0xFF; // inside chunk 2
+    mem.put("chunked/isolated.bin", Bytes::from(corrupted))
+        .await
+        .expect("put isolated");
+    let isolated_mid = store
+        .get("chunked/isolated.bin", mid_off, mid_len)
+        .await
+        .expect("chunk 1 unaffected by chunk 0/2 corruption");
+    assert_eq!(
+        &isolated_mid[..],
+        &payload[mid_off as usize..mid_off as usize + mid_len]
+    );
+    assert!(matches!(
+        store.get("chunked/isolated.bin", 0, 16).await,
+        Err(ObjectError::Crypto(_))
+    ));
+    assert!(matches!(
+        store
+            .get("chunked/isolated.bin", (2 * CHUNK_SIZE) as u64, 16)
+            .await,
+        Err(ObjectError::Crypto(_))
+    ));
+
+    // Exact chunk-boundary size (2 * CHUNK_SIZE) and empty object round-trip.
+    let exact = deterministic_payload(2 * CHUNK_SIZE);
+    store
+        .put("chunked/exact.bin", exact.clone())
+        .await
+        .expect("put exact");
+    assert_eq!(
+        store
+            .head("chunked/exact.bin")
+            .await
+            .expect("head exact")
+            .size,
+        exact.len() as u64
+    );
+    assert_eq!(
+        store
+            .get("chunked/exact.bin", 0, 0)
+            .await
+            .expect("get exact"),
+        exact
+    );
+
+    store
+        .put("chunked/empty.bin", Bytes::new())
+        .await
+        .expect("put empty");
+    assert_eq!(
+        store
+            .head("chunked/empty.bin")
+            .await
+            .expect("head empty")
+            .size,
+        0
+    );
+    assert_eq!(
+        store
+            .get("chunked/empty.bin", 0, 0)
+            .await
+            .expect("get empty"),
+        Bytes::new()
+    );
+
+    // Distinct random nonces on identical plaintexts.
+    store
+        .put("chunked/dup.bin", payload.clone())
+        .await
+        .expect("put dup");
+    let raw_dup = mem.get("chunked/dup.bin", 0, 0).await.expect("raw dup");
+    assert_ne!(raw, &raw_dup);
+
+    // Copy, restore, delete.
+    store
+        .copy("chunked/copied.bin", key_name)
+        .await
+        .expect("copy");
+    assert_eq!(
+        &store
+            .get("chunked/copied.bin", 0, 0)
+            .await
+            .expect("get copied")[..],
+        &payload[..]
+    );
+    store.restore(key_name, 7).await.expect("restore");
+    store.delete(key_name).await.expect("delete");
+    assert!(matches!(
+        store.head(key_name).await,
+        Err(ObjectError::NotFound(_))
+    ));
+}
+
+async fn run_chunked_encrypted_suite(cipher: ChunkedCipher) {
+    let mem = Arc::new(MemoryStore::new());
+    let recorder = Arc::new(RecordingStore::new(mem.clone()));
+    let key = [0x42u8; 32];
+    let store = ChunkedEncryptedStore::new(recorder.clone(), cipher, key);
+    store.create().await.expect("create");
+    assert!(store.description().ends_with("(encrypted-chunked)"));
+    assert_eq!(store.cipher(), cipher);
+    assert_eq!(store.chunk_size(), CHUNK_SIZE);
+    assert!(!store.limits().is_support_multipart_upload);
+
+    // > 150 KiB multi-chunk payload (3 chunks: 64 KiB + 64 KiB + ~32 KiB).
+    let payload_len = 160 * 1024 + 321;
+    let payload = deterministic_payload(payload_len);
+    let key_name = "chunked/multi.bin";
+    store.put(key_name, payload.clone()).await.expect("put");
+
+    // Verify raw encrypted layout: 17-byte header + 3 * (12 + 16) overhead + plaintext.
+    let raw = mem.get(key_name, 0, 0).await.expect("raw get");
+    assert_eq!(&raw[0..4], b"JFSC");
+    assert_eq!(raw.len(), HEADER_SIZE + payload_len + 3 * (12 + 16));
+
+    // head and list report plaintext size.
+    let meta = store.head(key_name).await.expect("head");
+    assert_eq!(meta.size, payload_len as u64);
+    let listed = store.list("chunked/").await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].size, payload_len as u64);
+
+    // Full read.
+    let full = store.get(key_name, 0, 0).await.expect("get full");
+    assert_eq!(full, payload);
+
+    verify_chunked_range_reads(&store, &recorder, key_name, &payload).await;
+    verify_chunked_isolation_and_edge_cases(&store, &mem, key_name, &payload, &raw).await;
+}
+
+#[tokio::test]
+async fn test_chunked_encrypted_store_aes256_gcm() {
+    run_chunked_encrypted_suite(ChunkedCipher::Aes256Gcm).await;
+}
+
+#[tokio::test]
+async fn test_chunked_encrypted_store_chacha20_poly1305() {
+    run_chunked_encrypted_suite(ChunkedCipher::ChaCha20Poly1305).await;
+}
+
+#[tokio::test]
+async fn test_chunked_encrypted_store_wrong_key_cipher_and_tamper_fail() {
+    let mem = Arc::new(MemoryStore::new());
+    let payload = deterministic_payload(160 * 1024 + 77);
+
+    for cipher in [ChunkedCipher::Aes256Gcm, ChunkedCipher::ChaCha20Poly1305] {
+        let writer = ChunkedEncryptedStore::new(mem.clone(), cipher, [0x11u8; 32]);
+        let wrong_key = ChunkedEncryptedStore::new(mem.clone(), cipher, [0x22u8; 32]);
+        let other_cipher = match cipher {
+            ChunkedCipher::Aes256Gcm => ChunkedCipher::ChaCha20Poly1305,
+            ChunkedCipher::ChaCha20Poly1305 => ChunkedCipher::Aes256Gcm,
+        };
+        let wrong_cipher = ChunkedEncryptedStore::new(mem.clone(), other_cipher, [0x11u8; 32]);
+
+        writer
+            .put("obj", payload.clone())
+            .await
+            .expect("put chunked");
+
+        // Wrong key fails on both full read and range read.
+        assert!(matches!(
+            wrong_key.get("obj", 0, 0).await,
+            Err(ObjectError::Crypto(_))
+        ));
+        assert!(matches!(
+            wrong_key.get("obj", CHUNK_SIZE as u64, 64).await,
+            Err(ObjectError::Crypto(_))
+        ));
+
+        // Wrong cipher fails.
+        assert!(matches!(
+            wrong_cipher.get("obj", 0, 0).await,
+            Err(ObjectError::Crypto(_))
+        ));
+        assert!(matches!(
+            wrong_cipher.get("obj", 0, 64).await,
+            Err(ObjectError::Crypto(_))
+        ));
+
+        let raw = mem.get("obj", 0, 0).await.expect("raw");
+
+        // Tamper ciphertext byte.
+        let mut tampered_ct = raw.to_vec();
+        tampered_ct[HEADER_SIZE + 12 + 5] ^= 0xFF;
+        mem.put("tampered-ct", Bytes::from(tampered_ct))
+            .await
+            .expect("put tampered ct");
+        assert!(matches!(
+            writer.get("tampered-ct", 0, 0).await,
+            Err(ObjectError::Crypto(_))
+        ));
+        assert!(matches!(
+            writer.get("tampered-ct", 0, 128).await,
+            Err(ObjectError::Crypto(_))
+        ));
+
+        // Tamper header total_plaintext_len (caught by header-bound AAD).
+        let mut tampered_hdr = raw.to_vec();
+        tampered_hdr[16] ^= 0x01;
+        mem.put("tampered-hdr", Bytes::from(tampered_hdr))
+            .await
+            .expect("put tampered hdr");
+        assert!(matches!(
+            writer.get("tampered-hdr", 0, 0).await,
+            Err(ObjectError::Crypto(_))
+        ));
+        assert!(matches!(
+            writer.get("tampered-hdr", 0, 64).await,
+            Err(ObjectError::Crypto(_))
+        ));
+
+        // Swap chunk 0 and chunk 1 (caught by chunk-index AAD).
+        let stride = CHUNK_SIZE + 28;
+        let mut swapped = raw.to_vec();
+        let (c0, c1_and_rest) = swapped[HEADER_SIZE..].split_at_mut(stride);
+        c0.swap_with_slice(&mut c1_and_rest[..stride]);
+        mem.put("swapped", Bytes::from(swapped))
+            .await
+            .expect("put swapped");
+        assert!(matches!(
+            writer.get("swapped", 0, 64).await,
+            Err(ObjectError::Crypto(_))
+        ));
+
+        // Truncated object fails.
+        let truncated = raw.slice(..HEADER_SIZE + 10);
+        mem.put("truncated", truncated)
+            .await
+            .expect("put truncated");
+        assert!(matches!(
+            writer.get("truncated", 0, 0).await,
+            Err(ObjectError::Crypto(_))
+        ));
+        assert!(matches!(
+            writer.get("truncated", 0, 32).await,
+            Err(ObjectError::Crypto(_))
+        ));
+
+        // Passphrase constructor works symmetrically.
+        let pass_w = ChunkedEncryptedStore::from_passphrase(mem.clone(), cipher, "secret-pass");
+        let pass_ok = ChunkedEncryptedStore::from_passphrase(mem.clone(), cipher, "secret-pass");
+        let pass_bad = ChunkedEncryptedStore::from_passphrase(mem.clone(), cipher, "other-pass");
+        pass_w
+            .put("pass", Bytes::from_static(b"passphrase chunked"))
+            .await
+            .expect("put pass");
+        assert_eq!(
+            &pass_ok.get("pass", 0, 0).await.expect("get pass")[..],
+            b"passphrase chunked"
+        );
+        assert!(matches!(
+            pass_bad.get("pass", 0, 0).await,
+            Err(ObjectError::Crypto(_))
+        ));
+    }
+
+    // Invalid key length rejected.
+    assert!(matches!(
+        ChunkedEncryptedStore::from_key_slice(mem, ChunkedCipher::Aes256Gcm, &[0u8; 16]),
+        Err(ObjectError::Crypto(_))
     ));
 }

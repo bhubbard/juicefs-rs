@@ -92,6 +92,10 @@ fn cli_full_volume_lifecycle() {
     let cfg_out = run(&["config", &meta]);
     assert!(cfg_out.contains("\"TrashDays\": 7"));
 
+    run(&["tier", &meta, "/work_clone/sub/test.txt", "--set", "2"]);
+    let tier_out = run(&["tier", &meta, "/work_clone/sub/test.txt"]);
+    assert!(tier_out.contains("Tier: 2"));
+
     run(&["bench", &meta, "/.bench_tmp", "--size-mb", "1"]);
     run(&["objbench", "mem://", "--size-mb", "1"]);
 

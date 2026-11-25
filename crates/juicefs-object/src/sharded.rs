@@ -156,4 +156,9 @@ impl ObjectStorage for ShardedStore {
         validate_key(key)?;
         self.pick(key).abort_upload(key, upload_id).await
     }
+
+    async fn restore(&self, key: &str, days: i32) -> Result<(), ObjectError> {
+        validate_key(key)?;
+        self.pick(key).restore(key, days).await
+    }
 }

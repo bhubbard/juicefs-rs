@@ -1050,6 +1050,7 @@ dependencies = [
  "bytes",
  "clap",
  "juicefs-core",
+ "juicefs-fuse",
  "juicefs-gateway",
  "juicefs-meta",
  "juicefs-object",
@@ -1072,6 +1073,21 @@ dependencies = [
  "thiserror",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "juicefs-fuse"
+version = "0.1.0"
+dependencies = [
+ "juicefs-core",
+ "juicefs-meta",
+ "juicefs-vfs",
+ "libc",
+ "parking_lot",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

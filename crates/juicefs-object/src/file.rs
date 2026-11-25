@@ -383,4 +383,15 @@ impl ObjectStorage for FileStore {
             Err(e) => Err(e.into()),
         }
     }
+
+    async fn restore(&self, key: &str, _days: i32) -> Result<(), ObjectError> {
+        let path = self.resolve_path(key)?;
+        match fs::metadata(&path).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(ObjectError::NotFound(key.to_owned()))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }

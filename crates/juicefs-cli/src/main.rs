@@ -292,6 +292,21 @@ enum Commands {
         /// Metadata URL
         meta_url: String,
     },
+    /// Set or inspect storage tier for a file
+    Tier {
+        /// Metadata URL
+        meta_url: String,
+        /// Path inside `JuiceFS`
+        path: String,
+        /// Optional tier ID (`0..=255`) to assign
+        #[arg(long)]
+        set: Option<u8>,
+    },
+    /// Unmount a FUSE mountpoint
+    Umount {
+        /// Mountpoint path
+        mountpoint: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -689,6 +704,24 @@ async fn dispatch_admin(command: Commands) -> Result<()> {
                 );
             }
         }
+        Commands::Tier {
+            meta_url,
+            path,
+            set,
+        } => {
+            let vfs = connect_vfs(&meta_url).await?;
+            if let Some(tier_id) = set {
+                let attr = vfs.set_tier(&path, tier_id).await?;
+                println!("Set tier={} on {path}", attr.tier);
+            } else {
+                let (_, attr) = vfs.resolve_path(&path).await?;
+                println!("Tier: {}", attr.tier);
+            }
+        }
+        Commands::Umount { mountpoint } => {
+            juicefs_fuse::unmount(&mountpoint)?;
+            println!("Unmounted {}", mountpoint.display());
+        }
         _ => unreachable!(),
     }
     Ok(())
@@ -787,7 +820,9 @@ async fn dispatch(command: Commands) -> Result<()> {
         | Commands::Objbench { .. }
         | Commands::Quota { .. }
         | Commands::Changelog { .. }
-        | Commands::Sessions { .. }) => dispatch_admin(cmd).await?,
+        | Commands::Sessions { .. }
+        | Commands::Tier { .. }
+        | Commands::Umount { .. }) => dispatch_admin(cmd).await?,
         other => dispatch_io(other).await?,
     }
     Ok(())

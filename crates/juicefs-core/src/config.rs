@@ -1,5 +1,6 @@
 //! Volume format and client/chunk configuration structures.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -7,6 +8,21 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::types::DEFAULT_BLOCK_SIZE;
+
+/// Storage tier configuration stored in [`Format::tiers`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct TierConfig {
+    /// Tier identifier (`0..=255`).
+    #[serde(rename = "ID")]
+    pub id: u8,
+    /// Object storage class for this tier (e.g. `STANDARD_IA`, `GLACIER`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub storage_class: String,
+    /// Optional tier tag.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tag: String,
+}
 
 /// Persistent volume format stored in metadata under the `format` setting key.
 ///
@@ -22,6 +38,12 @@ pub struct Format {
     pub uuid: String,
     /// Storage backend type (`file`, `s3`, `mem`, etc.).
     pub storage: String,
+    /// Default object storage class.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub storage_class: String,
+    /// Configured storage tiers keyed by tier ID.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tiers: BTreeMap<u8, TierConfig>,
     /// Bucket URL or local root path.
     pub bucket: String,
     /// Optional access key.
@@ -84,6 +106,8 @@ impl Format {
             name: name.into(),
             uuid: Uuid::new_v4().to_string(),
             storage: storage.into(),
+            storage_class: String::new(),
+            tiers: BTreeMap::new(),
             bucket: bucket.into(),
             access_key: String::new(),
             secret_key: String::new(),

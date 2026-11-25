@@ -118,4 +118,9 @@ impl ObjectStorage for PrefixedStore {
         let fk = self.full_key(key)?;
         self.inner.abort_upload(&fk, upload_id).await
     }
+
+    async fn restore(&self, key: &str, days: i32) -> Result<(), ObjectError> {
+        let fk = self.full_key(key)?;
+        self.inner.restore(&fk, days).await
+    }
 }

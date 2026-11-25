@@ -17,6 +17,7 @@ anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
 juicefs-core.workspace = true
+juicefs-fuse.workspace = true
 juicefs-gateway.workspace = true
 juicefs-meta.workspace = true
 juicefs-object.workspace = true

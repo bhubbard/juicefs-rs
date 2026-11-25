@@ -638,6 +638,22 @@ impl Vfs {
         }
         Ok(deleted)
     }
+
+    /// Updates the storage tier ID on `path`.
+    pub async fn set_tier(&self, path: &str, tier: u8) -> Result<Attr, VfsError> {
+        let (ino, mut attr) = self.resolve_path(path).await?;
+        attr.tier = tier;
+        Ok(self
+            .meta
+            .setattr(ino, &attr, juicefs_core::SetAttrFlags::TIER)
+            .await?)
+    }
+
+    /// Restores an archived object key for `days` days in the underlying object store.
+    pub async fn restore_object(&self, key: &str, days: i32) -> Result<(), VfsError> {
+        self.chunks.blob_storage().restore(key, days).await?;
+        Ok(())
+    }
 }
 
 /// Detailed inode, attribute, and chunk/slice layout returned by [`Vfs::info`].

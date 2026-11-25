@@ -390,6 +390,10 @@ macro_rules! delegate_cloud_storage {
             async fn abort_upload(&self, key: &str, upload_id: &str) -> Result<(), ObjectError> {
                 self.0.abort_upload(key, upload_id).await
             }
+
+            async fn restore(&self, key: &str, days: i32) -> Result<(), ObjectError> {
+                self.0.restore(key, days).await
+            }
         }
     };
 }

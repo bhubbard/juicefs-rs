@@ -180,4 +180,9 @@ impl ObjectStorage for EncryptedStore {
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectError> {
         self.inner.list(prefix).await
     }
+
+    async fn restore(&self, key: &str, days: i32) -> Result<(), ObjectError> {
+        validate_key(key)?;
+        self.inner.restore(key, days).await
+    }
 }

@@ -1132,6 +1132,9 @@ impl Meta for SqliteMeta {
                 cur.ctime = sec_now;
                 cur.ctime_nsec = nsec_now;
             }
+            if mask.contains(SetAttrFlags::TIER) {
+                cur.tier = attr.tier;
+            }
 
             let atime_us = cur.atime * 1_000_000 + i64::from(cur.atime_nsec) / 1_000;
             let mtime_us = cur.mtime * 1_000_000 + i64::from(cur.mtime_nsec) / 1_000;
@@ -1139,8 +1142,9 @@ impl Meta for SqliteMeta {
 
             tx.execute(
                 "UPDATE jfs_node SET mode = ?1, uid = ?2, gid = ?3,
-                 atime = ?4, atimensec = ?5, mtime = ?6, mtimensec = ?7, ctime = ?8, ctimensec = ?9
-                 WHERE inode = ?10",
+                 atime = ?4, atimensec = ?5, mtime = ?6, mtimensec = ?7, ctime = ?8, ctimensec = ?9,
+                 tier_id = ?10
+                 WHERE inode = ?11",
                 params![
                     cur.mode,
                     cur.uid,
@@ -1151,6 +1155,7 @@ impl Meta for SqliteMeta {
                     i64::from(cur.mtime_nsec) % 1_000,
                     ctime_us,
                     i64::from(cur.ctime_nsec) % 1_000,
+                    cur.tier,
                     inode.as_u64() as i64,
                 ],
             )?;
