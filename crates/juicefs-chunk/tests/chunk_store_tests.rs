@@ -571,3 +571,34 @@ async fn test_token_bucket_rate_limiter() {
         "download finished too fast for rate limit: {down_elapsed:?}"
     );
 }
+
+#[tokio::test]
+async fn test_writeback_async_upload_and_flush() {
+    let obj = Arc::new(CountingStore::new(Duration::from_millis(25)));
+    let cfg = ChunkConfig {
+        block_size: 256,
+        compression: "lz4".to_owned(),
+        buffer_size: 64 * 1024,
+        writeback: true,
+        ..Default::default()
+    };
+    let store = CachedChunkStore::new(Arc::clone(&obj) as Arc<_>, cfg).expect("chunk store");
+    let payload = b"writeback-async-payload-".repeat(25);
+
+    store.write_slice(123, &payload).await.expect("write_slice");
+
+    // Reads hit the moka memory cache immediately before background upload finishes.
+    let mut out = vec![0u8; payload.len()];
+    let n = store
+        .read_slice(123, payload.len(), 0, &mut out)
+        .await
+        .expect("read_slice");
+    assert_eq!(n, payload.len());
+    assert_eq!(out, payload);
+
+    // Flush waits for all background uploads to land in ObjectStorage.
+    store.flush().await.expect("flush");
+    assert_eq!(store.pending_writebacks(), 0);
+    let key0 = block_key(123, 0, 256, false);
+    assert!(obj.head(&key0).await.is_ok());
+}

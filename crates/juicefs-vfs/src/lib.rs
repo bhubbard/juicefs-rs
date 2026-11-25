@@ -654,6 +654,12 @@ impl Vfs {
         self.chunks.blob_storage().restore(key, days).await?;
         Ok(())
     }
+
+    /// Flushes any pending asynchronous write-back uploads in the chunk store.
+    pub async fn flush(&self) -> Result<(), VfsError> {
+        self.chunks.flush().await?;
+        Ok(())
+    }
 }
 
 /// Detailed inode, attribute, and chunk/slice layout returned by [`Vfs::info`].

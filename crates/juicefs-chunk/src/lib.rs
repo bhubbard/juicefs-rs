@@ -6,6 +6,7 @@ pub mod error;
 pub mod prefetch;
 pub mod ratelimit;
 pub mod singleflight;
+pub mod writeback;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,6 +22,7 @@ pub use error::ChunkError;
 pub use prefetch::Prefetcher;
 pub use ratelimit::TokenBucket;
 pub use singleflight::SingleFlight;
+pub use writeback::WritebackQueue;
 
 /// Computes the canonical `JuiceFS` object key for block `index` of `slice_id`.
 #[must_use]
@@ -81,6 +83,7 @@ struct ChunkStoreInner {
     prefetch_window: AtomicUsize,
     upload_limit: RwLock<Option<TokenBucket>>,
     download_limit: RwLock<Option<TokenBucket>>,
+    writeback: WritebackQueue,
 }
 
 impl ChunkStoreInner {
@@ -153,6 +156,7 @@ impl CachedChunkStore {
                 prefetch_window: AtomicUsize::new(default_prefetch),
                 upload_limit: RwLock::new(None),
                 download_limit: RwLock::new(None),
+                writeback: WritebackQueue::new(16),
             }
         });
 
@@ -299,12 +303,44 @@ impl CachedChunkStore {
         }
     }
 
+    /// Flushes all pending asynchronous write-back uploads to object storage.
+    pub async fn flush(&self) -> Result<(), ChunkError> {
+        self.inner.writeback.flush().await
+    }
+
+    /// Returns the number of pending background write-back upload tasks.
+    #[must_use]
+    pub fn pending_writebacks(&self) -> usize {
+        self.inner.writeback.pending()
+    }
+
     /// Writes a complete slice (`slice_id`) split into `block_size` blocks.
     pub async fn write_slice(&self, slice_id: u64, data: &[u8]) -> Result<(), ChunkError> {
         if data.is_empty() {
             return Ok(());
         }
         let bsize = self.inner.config.block_size;
+        if self.inner.config.writeback {
+            for (idx, block) in data.chunks(bsize).enumerate() {
+                let key = block_key(slice_id, idx, block.len(), self.inner.config.hash_prefix);
+                let raw = Bytes::copy_from_slice(block);
+                self.inner.mem_cache.insert(key.clone(), raw.clone());
+                if let Some(dc) = &self.inner.disk_cache {
+                    dc.put(&key, &raw).await?;
+                }
+                let inner = Arc::clone(&self.inner);
+                self.inner.writeback.submit(async move {
+                    let compressed = inner.algo.compress(&raw)?;
+                    let up_limiter = inner.upload_limit.read().clone();
+                    if let Some(limiter) = up_limiter {
+                        limiter.acquire(compressed.len() as u64).await;
+                    }
+                    inner.store.put(&key, Bytes::from(compressed)).await?;
+                    Ok(())
+                });
+            }
+            return Ok(());
+        }
         let futures = data.chunks(bsize).enumerate().map(|(idx, block)| {
             let key = block_key(slice_id, idx, block.len(), self.inner.config.hash_prefix);
             let inner = Arc::clone(&self.inner);

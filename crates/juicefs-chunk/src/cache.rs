@@ -1,12 +1,13 @@
 //! In-memory and local disk block caches for `juicefs-chunk`.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use moka::sync::Cache;
 use parking_lot::Mutex;
 use tokio::fs;
 
@@ -27,90 +28,67 @@ pub enum EvictionPolicy {
     Lru,
 }
 
-/// Simple FIFO-bounded in-memory block cache.
+/// Concurrent byte-weighted in-memory block cache powered by `moka`.
 #[derive(Debug)]
 pub struct MemoryBlockCache {
     max_bytes: usize,
-    inner: Mutex<MemCacheInner>,
-}
-
-#[derive(Debug, Default)]
-struct MemCacheInner {
-    used_bytes: usize,
-    entries: HashMap<String, Bytes>,
-    order: VecDeque<String>,
+    cache: Cache<String, Bytes>,
 }
 
 impl MemoryBlockCache {
     /// Creates a new in-memory cache with capacity `max_bytes`.
     #[must_use]
     pub fn new(max_bytes: usize) -> Self {
-        Self {
-            max_bytes,
-            inner: Mutex::new(MemCacheInner::default()),
-        }
+        let cache = Cache::builder()
+            .max_capacity(max_bytes as u64)
+            .weigher(|_k: &String, v: &Bytes| v.len().min(u32::MAX as usize) as u32)
+            .build();
+        Self { max_bytes, cache }
     }
 
     /// Returns `true` if `key` is currently cached in memory.
     #[must_use]
     pub fn contains(&self, key: &str) -> bool {
-        self.inner.lock().entries.contains_key(key)
+        self.cache.contains_key(key)
     }
 
     /// Returns the number of blocks currently held in the memory cache.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().entries.len()
+        self.cache.run_pending_tasks();
+        self.cache.entry_count() as usize
     }
 
     /// Returns `true` if the memory cache holds no blocks.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().entries.is_empty()
+        self.len() == 0
     }
 
     /// Retrieves a cached uncompressed block if present.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<Bytes> {
-        self.inner.lock().entries.get(key).cloned()
+        self.cache.get(key)
     }
 
-    /// Inserts an uncompressed block into the cache, evicting oldest entries if needed.
+    /// Inserts an uncompressed block into the cache, evicting entries via TinyLFU/LRU if needed.
     pub fn insert(&self, key: String, data: Bytes) {
-        let data_len = data.len();
-        if self.max_bytes == 0 || data_len > self.max_bytes {
+        if self.max_bytes == 0 || data.len() > self.max_bytes {
             return;
         }
-        let mut guard = self.inner.lock();
-        if let Some(prev) = guard.entries.insert(key.clone(), data) {
-            guard.used_bytes = guard.used_bytes.saturating_sub(prev.len());
-        } else {
-            guard.order.push_back(key);
-        }
-        guard.used_bytes += data_len;
-
-        while guard.used_bytes > self.max_bytes {
-            let Some(oldest) = guard.order.pop_front() else {
-                break;
-            };
-            if let Some(removed) = guard.entries.remove(&oldest) {
-                guard.used_bytes = guard.used_bytes.saturating_sub(removed.len());
-            }
-        }
+        self.cache.insert(key, data);
     }
 
     /// Removes a block from the in-memory cache.
     pub fn remove(&self, key: &str) {
-        let mut guard = self.inner.lock();
-        if let Some(removed) = guard.entries.remove(key) {
-            guard.used_bytes = guard.used_bytes.saturating_sub(removed.len());
-        }
+        self.cache.invalidate(key);
     }
 
     /// Returns total bytes currently held in the memory cache.
     #[must_use]
     pub fn used_bytes(&self) -> usize {
-        self.inner.lock().used_bytes
+        self.cache.run_pending_tasks();
+        self.cache.weighted_size() as usize
     }
 }
 
