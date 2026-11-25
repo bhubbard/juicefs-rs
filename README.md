@@ -1,4 +1,4 @@
-# juicefs-rs
+# juicefs-rs `v0.2.0`
 
 A pure-Rust port of the [JuiceFS](https://github.com/juicedata/juicefs) distributed POSIX filesystem architecture — zero Go runtime, zero C/`libfuse` build dependencies, and native support for both macOS and Linux.
 
@@ -47,12 +47,12 @@ Measured on Apple Silicon (macOS, `--release` profile) against `/opt/homebrew/bi
 
 | Operation | `juicefs-rs` | `juicefs-go` | Notes |
 |---|---:|---:|---|
-| `format` (`sqlite3` + `file` + `lz4`) | **0.038 s** | 0.083 s | **2.2× faster** (single-tx schema + init) |
-| `status` | **0.037 s** | 0.078 s | **2.1× faster** |
-| `fsck` | **0.036 s** | 0.075 s | **2.1× faster** |
-| `sync` (`100 × 128 KiB`, `--threads 8`) | **0.046 s** | 0.095 s | **2.1× faster** |
-| `vfs put 16 MiB` | **0.075 s** (~213 MiB/s) | — | End-to-end CLI upload |
-| `vfs get 16 MiB` | **0.054 s** (~296 MiB/s) | — | End-to-end CLI download |
+| `format` (`sqlite3` + `file` + `lz4`) | **0.038 s** | 0.085 s | **2.2× faster** (creates bucket + single-tx WAL schema/init) |
+| `status` | **0.036 s** | 0.075 s | **2.1× faster** |
+| `fsck` | **0.036 s** | 0.078 s | **2.2× faster** (metadata consistency check on empty volume) |
+| `sync` (`100 × 128 KiB`, `--threads 8`) | **0.046 s** | 0.081 s | **1.8× faster** |
+| `vfs put 16 MiB` | **0.070 s** (~229 MiB/s) | — | End-to-end CLI upload |
+| `vfs get 16 MiB` | **0.052 s** (~308 MiB/s) | — | End-to-end CLI download |
 
 ### Criterion Microbenchmarks (`cargo bench -p juicefs-vfs --bench vfs_bench`)
 

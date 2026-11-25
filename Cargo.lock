@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "juicefs-chunk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "futures",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "juicefs-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "juicefs-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "lz4_flex",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "juicefs-fuse"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "juicefs-core",
  "juicefs-meta",
@@ -1102,7 +1102,7 @@ dependencies = [
 
 [[package]]
 name = "juicefs-gateway"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "juicefs-meta"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "juicefs-core",
@@ -1140,11 +1140,11 @@ dependencies = [
 
 [[package]]
 name = "juicefs-metric"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "juicefs-object"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1162,7 +1162,7 @@ dependencies = [
 
 [[package]]
 name = "juicefs-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "juicefs-vfs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -1193,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "juicefs-webdav"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "chrono",
