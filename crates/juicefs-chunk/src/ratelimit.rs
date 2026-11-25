@@ -1,9 +1,8 @@
 //! Token-bucket rate limiter for object storage upload/download bandwidth control.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use parking_lot::Mutex;
 use tokio::time::Instant;
 
 /// Asynchronous token-bucket rate limiter supporting burst capacity and smooth pacing.
@@ -72,7 +71,7 @@ impl TokenBucket {
     /// Returns the currently available (non-negative) token count after refilling.
     #[must_use]
     pub fn available(&self) -> f64 {
-        let mut guard = self.inner.state.lock();
+        let mut guard = self.inner.state.lock().expect("lock poisoned");
         self.refill_locked(&mut guard);
         guard.available.max(0.0)
     }
@@ -86,7 +85,7 @@ impl TokenBucket {
         if tokens == 0 || self.inner.rate <= 0.0 {
             return true;
         }
-        let mut guard = self.inner.state.lock();
+        let mut guard = self.inner.state.lock().expect("lock poisoned");
         self.refill_locked(&mut guard);
         let needed = tokens as f64;
         if guard.available >= needed {
@@ -107,7 +106,7 @@ impl TokenBucket {
         }
 
         let wait_dur = {
-            let mut guard = self.inner.state.lock();
+            let mut guard = self.inner.state.lock().expect("lock poisoned");
             self.refill_locked(&mut guard);
             guard.available -= tokens as f64;
             if guard.available < 0.0 {

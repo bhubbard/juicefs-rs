@@ -2,9 +2,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use parking_lot::Mutex;
 use tokio::sync::watch;
 
 type FlightMap<T, E> = Mutex<HashMap<String, watch::Receiver<Option<Result<T, Arc<E>>>>>>;
@@ -40,7 +39,10 @@ struct FlightGuard<'a, T, E> {
 impl<T, E> Drop for FlightGuard<'_, T, E> {
     fn drop(&mut self) {
         if !self.completed {
-            self.flights.lock().remove(&self.key);
+            self.flights
+                .lock()
+                .expect("lock poisoned")
+                .remove(&self.key);
         }
     }
 }
@@ -57,7 +59,7 @@ impl<T, E> SingleFlight<T, E> {
     /// Returns the number of keys currently in flight.
     #[must_use]
     pub fn in_flight_count(&self) -> usize {
-        self.flights.lock().len()
+        self.flights.lock().expect("lock poisoned").len()
     }
 }
 
@@ -80,7 +82,7 @@ where
 
         loop {
             let role = {
-                let mut guard = self.flights.lock();
+                let mut guard = self.flights.lock().expect("lock poisoned");
                 if let Some(rx) = guard.get(key) {
                     FlightRole::Waiter(rx.clone())
                 } else {
@@ -104,7 +106,7 @@ where
                     let res = fut.await.map_err(Arc::new);
 
                     {
-                        let mut map = self.flights.lock();
+                        let mut map = self.flights.lock().expect("lock poisoned");
                         map.remove(key);
                         guard.completed = true;
                     }
@@ -133,7 +135,12 @@ where
     ///
     /// Returns `None` immediately when no flight for `key` is currently active.
     pub async fn try_piggyback(&self, key: &str) -> Option<Result<T, Arc<E>>> {
-        let mut rx = self.flights.lock().get(key).cloned()?;
+        let mut rx = self
+            .flights
+            .lock()
+            .expect("lock poisoned")
+            .get(key)
+            .cloned()?;
         loop {
             if let Some(res) = rx.borrow_and_update().as_ref().cloned() {
                 return Some(res);

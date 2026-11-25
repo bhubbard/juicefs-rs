@@ -1,12 +1,50 @@
 //! Consistent key-sharding wrapper across multiple [`ObjectStorage`] backends.
 
+use std::future::{Future, poll_fn};
 use std::sync::Arc;
+use std::task::Poll;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::future::try_join_all;
 
 use crate::{Limits, MultipartUpload, ObjectError, ObjectMeta, ObjectStorage, Part, validate_key};
+
+async fn try_join_all<F, T>(futs: impl IntoIterator<Item = F>) -> Result<Vec<T>, ObjectError>
+where
+    F: Future<Output = Result<T, ObjectError>>,
+{
+    let mut pinned: Vec<_> = futs.into_iter().map(Box::pin).collect();
+    let mut results: Vec<Option<T>> = std::iter::repeat_with(|| None).take(pinned.len()).collect();
+    poll_fn(|cx| {
+        let mut all_done = true;
+        for (idx, fut) in pinned.iter_mut().enumerate() {
+            if results[idx].is_some() {
+                continue;
+            }
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(val)) => {
+                    results[idx] = Some(val);
+                }
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    all_done = false;
+                }
+            }
+        }
+        if all_done {
+            let out = std::mem::take(&mut results)
+                .into_iter()
+                .map(|r| r.expect("all futures completed"))
+                .collect();
+            Poll::Ready(Ok(out))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
 
 const FNV1A_32_OFFSET_BASIS: u32 = 0x811c_9dc5;
 const FNV1A_32_PRIME: u32 = 0x0100_0193;

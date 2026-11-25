@@ -26,7 +26,6 @@ juicefs-core = { path = "../juicefs-core" }
 juicefs-meta = { path = "../juicefs-meta" }
 juicefs-vfs = { path = "../juicefs-vfs" }
 libc = "0.2"
-parking_lot = "0.12"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

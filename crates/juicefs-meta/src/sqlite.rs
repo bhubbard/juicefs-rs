@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use juicefs_core::{
@@ -10,7 +10,6 @@ use juicefs_core::{
     SetAttrFlags, Slice, SliceRecord, StatFs, TRASH_INODE, build_slice, decode_slices,
     encode_slice,
 };
-use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::util::{
@@ -213,7 +212,7 @@ impl SqliteMeta {
     {
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || {
-            let mut guard = conn.lock();
+            let mut guard = conn.lock().expect("lock poisoned");
             f(&mut guard)
         })
         .await

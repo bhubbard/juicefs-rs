@@ -17,9 +17,9 @@ use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use http::header::{
     ACCEPT_RANGES, ALLOW, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE,
 };
@@ -806,12 +806,21 @@ async fn resolve_content_type(vfs: &Vfs, ino: Ino) -> String {
     "application/octet-stream".to_owned()
 }
 
-fn attr_mtime(attr: &Attr) -> DateTime<Utc> {
-    DateTime::from_timestamp(attr.mtime, attr.mtime_nsec).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+fn system_time_from_unix(secs: i64, nsec: u32) -> SystemTime {
+    let Ok(secs) = u64::try_from(secs) else {
+        return UNIX_EPOCH;
+    };
+    UNIX_EPOCH
+        .checked_add(Duration::new(secs, nsec))
+        .unwrap_or(UNIX_EPOCH)
 }
 
-fn attr_ctime(attr: &Attr) -> DateTime<Utc> {
-    DateTime::from_timestamp(attr.ctime, attr.ctime_nsec).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+fn attr_mtime(attr: &Attr) -> SystemTime {
+    system_time_from_unix(attr.mtime, attr.mtime_nsec)
+}
+
+fn attr_ctime(attr: &Attr) -> SystemTime {
+    system_time_from_unix(attr.ctime, attr.ctime_nsec)
 }
 
 fn empty_response(status: StatusCode) -> Response<BoxBody> {

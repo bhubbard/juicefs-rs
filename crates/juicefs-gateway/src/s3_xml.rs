@@ -1,8 +1,7 @@
 //! S3 XML serialization helpers for `ListObjectsV2` and error responses.
 
 use std::fmt::Write as _;
-
-use chrono::{DateTime, Utc};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Single object entry in an S3 `ListObjectsV2` response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,7 +9,7 @@ pub struct ObjectEntry {
     /// Object key relative to the bucket root.
     pub key: String,
     /// Last modification timestamp.
-    pub last_modified: DateTime<Utc>,
+    pub last_modified: SystemTime,
     /// Entity tag (quoted or unquoted; formatted as quoted in XML).
     pub etag: String,
     /// Object payload size in bytes.
@@ -38,6 +37,38 @@ pub struct ListObjectsV2Result<'a> {
     pub contents: &'a [ObjectEntry],
     /// Rolled-up common prefixes when `delimiter` is set.
     pub common_prefixes: &'a [String],
+}
+
+/// Converts days since the Unix epoch (`1970-01-01`) to `(year, month, day)`.
+///
+/// Implements Howard Hinnant's `civil_from_days` algorithm.
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + i64::from(m <= 2);
+    (y, m as u32, d as u32)
+}
+
+/// Formats a [`SystemTime`] as an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS.000Z`).
+#[must_use]
+pub fn format_iso8601_utc(ts: SystemTime) -> String {
+    let dur = ts.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let total_secs = dur.as_secs();
+    let millis = dur.subsec_millis();
+    let days = (total_secs / 86_400) as i64;
+    let secs_of_day = total_secs % 86_400;
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
 /// Escapes special XML characters in text nodes.
@@ -102,7 +133,7 @@ pub fn render_list_objects_v2(result: &ListObjectsV2Result<'_>) -> String {
         escape_xml(&obj.key, &mut xml);
         xml.push_str("</Key>");
 
-        let ts = obj.last_modified.format("%Y-%m-%dT%H:%M:%S%.3fZ");
+        let ts = format_iso8601_utc(obj.last_modified);
         let _ = write!(xml, "<LastModified>{ts}</LastModified>");
 
         xml.push_str("<ETag>");
@@ -143,4 +174,25 @@ pub fn render_error(code: &str, message: &str, resource: &str) -> String {
     escape_xml(resource, &mut xml);
     xml.push_str("</Resource></Error>");
     xml
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn iso8601_utc_formats_epoch_leap_days_and_millis() {
+        assert_eq!(format_iso8601_utc(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+
+        let leap_2000 = UNIX_EPOCH + Duration::new(951_868_799, 456_000_000);
+        assert_eq!(format_iso8601_utc(leap_2000), "2000-02-29T23:59:59.456Z");
+
+        let leap_2024 = UNIX_EPOCH + Duration::new(1_709_251_199, 789_000_000);
+        assert_eq!(format_iso8601_utc(leap_2024), "2024-02-29T23:59:59.789Z");
+
+        let nov_2023 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(format_iso8601_utc(nov_2023), "2023-11-14T22:13:20.000Z");
+    }
 }

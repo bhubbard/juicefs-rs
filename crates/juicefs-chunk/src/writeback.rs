@@ -1,9 +1,8 @@
 //! Asynchronous write-back upload queue for [`crate::CachedChunkStore`].
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
@@ -39,7 +38,7 @@ impl WritebackQueue {
                 .map_err(|_| ChunkError::Io(std::io::Error::other("writeback semaphore closed")))?;
             fut.await
         });
-        let mut guard = self.tasks.lock();
+        let mut guard = self.tasks.lock().expect("lock poisoned");
         guard.retain(|h| !h.is_finished());
         guard.push(handle);
     }
@@ -47,7 +46,7 @@ impl WritebackQueue {
     /// Returns the number of currently tracked background upload tasks.
     #[must_use]
     pub fn pending(&self) -> usize {
-        let mut guard = self.tasks.lock();
+        let mut guard = self.tasks.lock().expect("lock poisoned");
         guard.retain(|h| !h.is_finished());
         guard.len()
     }
@@ -55,7 +54,7 @@ impl WritebackQueue {
     /// Waits for all queued write-back uploads to complete, returning the first error if any.
     pub async fn flush(&self) -> Result<(), ChunkError> {
         let handles: Vec<_> = {
-            let mut guard = self.tasks.lock();
+            let mut guard = self.tasks.lock().expect("lock poisoned");
             std::mem::take(&mut *guard)
         };
         let mut first_err: Option<ChunkError> = None;

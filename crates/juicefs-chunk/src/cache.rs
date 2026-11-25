@@ -2,13 +2,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use moka::sync::Cache;
-use parking_lot::Mutex;
 use tokio::fs;
 
 use crate::ChunkError;
@@ -324,25 +323,40 @@ impl DiskBlockCache {
     /// Returns total cached bytes currently tracked on disk.
     #[must_use]
     pub fn used_bytes(&self) -> u64 {
-        self.inner.state.lock().used_bytes
+        self.inner.state.lock().expect("lock poisoned").used_bytes
     }
 
     /// Returns the number of cached block files currently tracked.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.state.lock().entries.len()
+        self.inner
+            .state
+            .lock()
+            .expect("lock poisoned")
+            .entries
+            .len()
     }
 
     /// Returns `true` if no blocks are currently tracked in the disk cache.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inner.state.lock().entries.is_empty()
+        self.inner
+            .state
+            .lock()
+            .expect("lock poisoned")
+            .entries
+            .is_empty()
     }
 
     /// Returns `true` if `key` is currently tracked in the disk cache index.
     #[must_use]
     pub fn contains(&self, key: &str) -> bool {
-        self.inner.state.lock().entries.contains_key(key)
+        self.inner
+            .state
+            .lock()
+            .expect("lock poisoned")
+            .entries
+            .contains_key(key)
     }
 
     fn block_path(&self, key: &str) -> PathBuf {
@@ -356,7 +370,7 @@ impl DiskBlockCache {
             Ok(bytes) => {
                 let len = bytes.len() as u64;
                 let evicted = {
-                    let mut state = self.inner.state.lock();
+                    let mut state = self.inner.state.lock().expect("lock poisoned");
                     if state.entries.contains_key(key) {
                         state.touch(key);
                         Vec::new()
@@ -371,7 +385,7 @@ impl DiskBlockCache {
                 Ok(Some(Bytes::from(bytes)))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.inner.state.lock().remove(key);
+                self.inner.state.lock().expect("lock poisoned").remove(key);
                 Ok(None)
             }
             Err(e) => Err(e.into()),
@@ -396,7 +410,7 @@ impl DiskBlockCache {
         fs::rename(&tmp, &path).await?;
 
         let evicted = {
-            let mut state = self.inner.state.lock();
+            let mut state = self.inner.state.lock().expect("lock poisoned");
             state.insert(key.to_owned(), data_len);
             self.evict_excess_locked(&mut state, Some(key))
         };
@@ -406,7 +420,7 @@ impl DiskBlockCache {
 
     /// Removes a cached block from disk and capacity tracking if it exists.
     pub async fn remove(&self, key: &str) -> Result<(), ChunkError> {
-        self.inner.state.lock().remove(key);
+        self.inner.state.lock().expect("lock poisoned").remove(key);
         let path = self.block_path(key);
         match fs::remove_file(&path).await {
             Ok(()) => Ok(()),

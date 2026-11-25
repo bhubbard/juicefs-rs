@@ -1,11 +1,11 @@
 //! In-memory [`ObjectStorage`] implementation for testing and ephemeral volumes.
 
 use std::collections::BTreeMap;
+use std::sync::RwLock;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use parking_lot::RwLock;
 use uuid::Uuid;
 
 use crate::{
@@ -65,7 +65,7 @@ impl ObjectStorage for MemoryStore {
 
     async fn get(&self, key: &str, offset: u64, limit: usize) -> Result<Bytes, ObjectError> {
         validate_key(key)?;
-        let guard = self.objects.read();
+        let guard = self.objects.read().expect("lock poisoned");
         let obj = guard
             .get(key)
             .ok_or_else(|| ObjectError::NotFound(key.to_owned()))?;
@@ -90,7 +90,7 @@ impl ObjectStorage for MemoryStore {
 
     async fn put(&self, key: &str, data: Bytes) -> Result<(), ObjectError> {
         validate_key(key)?;
-        self.objects.write().insert(
+        self.objects.write().expect("lock poisoned").insert(
             key.to_owned(),
             StoredObject {
                 data,
@@ -102,7 +102,7 @@ impl ObjectStorage for MemoryStore {
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectError> {
         validate_key(key)?;
-        let guard = self.objects.read();
+        let guard = self.objects.read().expect("lock poisoned");
         let obj = guard
             .get(key)
             .ok_or_else(|| ObjectError::NotFound(key.to_owned()))?;
@@ -116,14 +116,14 @@ impl ObjectStorage for MemoryStore {
 
     async fn delete(&self, key: &str) -> Result<(), ObjectError> {
         validate_key(key)?;
-        self.objects.write().remove(key);
+        self.objects.write().expect("lock poisoned").remove(key);
         Ok(())
     }
 
     async fn copy(&self, dst: &str, src: &str) -> Result<(), ObjectError> {
         validate_key(dst)?;
         validate_key(src)?;
-        let mut guard = self.objects.write();
+        let mut guard = self.objects.write().expect("lock poisoned");
         let src_obj = guard
             .get(src)
             .cloned()
@@ -139,7 +139,7 @@ impl ObjectStorage for MemoryStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, ObjectError> {
-        let guard = self.objects.read();
+        let guard = self.objects.read().expect("lock poisoned");
         let out = guard
             .range(prefix.to_owned()..)
             .take_while(|(k, _)| k.starts_with(prefix))
@@ -156,7 +156,7 @@ impl ObjectStorage for MemoryStore {
     async fn create_multipart_upload(&self, key: &str) -> Result<MultipartUpload, ObjectError> {
         validate_key(key)?;
         let upload_id = Uuid::new_v4().to_string();
-        self.uploads.write().insert(
+        self.uploads.write().expect("lock poisoned").insert(
             upload_id.clone(),
             MemoryMultipartUpload {
                 key: key.to_owned(),
@@ -183,7 +183,7 @@ impl ObjectStorage for MemoryStore {
                 "multipart part number must be >= 1".to_owned(),
             ));
         }
-        let mut uploads = self.uploads.write();
+        let mut uploads = self.uploads.write().expect("lock poisoned");
         let upload = uploads
             .get_mut(upload_id)
             .ok_or_else(|| ObjectError::NotFound(format!("upload {upload_id}")))?;
@@ -209,7 +209,7 @@ impl ObjectStorage for MemoryStore {
         validate_parts_order(parts)?;
 
         let assembled = {
-            let mut uploads = self.uploads.write();
+            let mut uploads = self.uploads.write().expect("lock poisoned");
             let upload = uploads
                 .get(upload_id)
                 .ok_or_else(|| ObjectError::NotFound(format!("upload {upload_id}")))?;
@@ -244,7 +244,7 @@ impl ObjectStorage for MemoryStore {
             buf.freeze()
         };
 
-        self.objects.write().insert(
+        self.objects.write().expect("lock poisoned").insert(
             key.to_owned(),
             StoredObject {
                 data: assembled,
@@ -256,7 +256,7 @@ impl ObjectStorage for MemoryStore {
 
     async fn abort_upload(&self, key: &str, upload_id: &str) -> Result<(), ObjectError> {
         validate_key(key)?;
-        let mut uploads = self.uploads.write();
+        let mut uploads = self.uploads.write().expect("lock poisoned");
         if let Some(upload) = uploads.get(upload_id) {
             if upload.key != key {
                 return Err(ObjectError::Backend(format!(

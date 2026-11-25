@@ -8,14 +8,13 @@ pub mod ratelimit;
 pub mod singleflight;
 pub mod writeback;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
-use futures::future::try_join_all;
 use juicefs_core::{ChunkConfig, CompressionAlgo};
 use juicefs_object::{ObjectError, ObjectStorage};
-use parking_lot::RwLock;
+use tokio::task::JoinSet;
 
 pub use cache::{DiskBlockCache, EvictionPolicy, MemoryBlockCache};
 pub use error::ChunkError;
@@ -105,7 +104,7 @@ impl ChunkStoreInner {
                     return Ok(hit);
                 }
 
-                let down_limiter = self.download_limit.read().clone();
+                let down_limiter = self.download_limit.read().expect("lock poisoned").clone();
                 let is_compressed = !matches!(self.algo, CompressionAlgo::None);
                 if !is_compressed && let Some(limiter) = &down_limiter {
                     limiter.acquire(blen as u64).await;
@@ -198,7 +197,7 @@ impl CachedChunkStore {
     pub fn with_prefetch(self, parallel: usize) -> Self {
         let weak = Arc::downgrade(&self.inner);
         let prefetcher = Self::build_prefetcher(weak, parallel);
-        *self.inner.prefetcher.write() = prefetcher;
+        *self.inner.prefetcher.write().expect("lock poisoned") = prefetcher;
         self.inner
             .prefetch_window
             .store(parallel, Ordering::Relaxed);
@@ -209,7 +208,7 @@ impl CachedChunkStore {
     #[must_use]
     pub fn with_upload_limit(self, bytes_per_sec: u64) -> Self {
         let limiter = (bytes_per_sec > 0).then(|| TokenBucket::from_bytes_per_sec(bytes_per_sec));
-        *self.inner.upload_limit.write() = limiter;
+        *self.inner.upload_limit.write().expect("lock poisoned") = limiter;
         self
     }
 
@@ -217,21 +216,21 @@ impl CachedChunkStore {
     #[must_use]
     pub fn with_download_limit(self, bytes_per_sec: u64) -> Self {
         let limiter = (bytes_per_sec > 0).then(|| TokenBucket::from_bytes_per_sec(bytes_per_sec));
-        *self.inner.download_limit.write() = limiter;
+        *self.inner.download_limit.write().expect("lock poisoned") = limiter;
         self
     }
 
     /// Configures a custom [`TokenBucket`] for upload rate limiting.
     #[must_use]
     pub fn with_upload_limiter(self, limiter: Option<TokenBucket>) -> Self {
-        *self.inner.upload_limit.write() = limiter;
+        *self.inner.upload_limit.write().expect("lock poisoned") = limiter;
         self
     }
 
     /// Configures a custom [`TokenBucket`] for download rate limiting.
     #[must_use]
     pub fn with_download_limiter(self, limiter: Option<TokenBucket>) -> Self {
-        *self.inner.download_limit.write() = limiter;
+        *self.inner.download_limit.write().expect("lock poisoned") = limiter;
         self
     }
 
@@ -243,10 +242,10 @@ impl CachedChunkStore {
         upload_bytes_per_sec: Option<u64>,
         download_bytes_per_sec: Option<u64>,
     ) {
-        *self.inner.upload_limit.write() = upload_bytes_per_sec
+        *self.inner.upload_limit.write().expect("lock poisoned") = upload_bytes_per_sec
             .filter(|&bps| bps > 0)
             .map(TokenBucket::from_bytes_per_sec);
-        *self.inner.download_limit.write() = download_bytes_per_sec
+        *self.inner.download_limit.write().expect("lock poisoned") = download_bytes_per_sec
             .filter(|&bps| bps > 0)
             .map(TokenBucket::from_bytes_per_sec);
     }
@@ -284,7 +283,11 @@ impl CachedChunkStore {
     /// Schedules a specific block key for asynchronous background prefetching.
     #[must_use]
     pub fn prefetch_key(&self, key: &str) -> bool {
-        self.inner.prefetcher.read().fetch(key)
+        self.inner
+            .prefetcher
+            .read()
+            .expect("lock poisoned")
+            .fetch(key)
     }
 
     /// Schedules upcoming blocks `[start_idx .. start_idx + count)` of `slice_id` for prefetching.
@@ -298,7 +301,11 @@ impl CachedChunkStore {
             }
             let key = block_key(slice_id, idx, blen, self.inner.config.hash_prefix);
             if !self.inner.mem_cache.contains(&key) {
-                self.inner.prefetcher.read().fetch(&key);
+                self.inner
+                    .prefetcher
+                    .read()
+                    .expect("lock poisoned")
+                    .fetch(&key);
             }
         }
     }
@@ -331,7 +338,7 @@ impl CachedChunkStore {
                 let inner = Arc::clone(&self.inner);
                 self.inner.writeback.submit(async move {
                     let compressed = inner.algo.compress(&raw)?;
-                    let up_limiter = inner.upload_limit.read().clone();
+                    let up_limiter = inner.upload_limit.read().expect("lock poisoned").clone();
                     if let Some(limiter) = up_limiter {
                         limiter.acquire(compressed.len() as u64).await;
                     }
@@ -341,13 +348,14 @@ impl CachedChunkStore {
             }
             return Ok(());
         }
-        let futures = data.chunks(bsize).enumerate().map(|(idx, block)| {
+        let mut join_set = JoinSet::new();
+        for (idx, block) in data.chunks(bsize).enumerate() {
             let key = block_key(slice_id, idx, block.len(), self.inner.config.hash_prefix);
             let inner = Arc::clone(&self.inner);
             let raw = Bytes::copy_from_slice(block);
-            async move {
+            join_set.spawn(async move {
                 let compressed = inner.algo.compress(&raw)?;
-                let up_limiter = inner.upload_limit.read().clone();
+                let up_limiter = inner.upload_limit.read().expect("lock poisoned").clone();
                 if let Some(limiter) = up_limiter {
                     limiter.acquire(compressed.len() as u64).await;
                 }
@@ -357,9 +365,11 @@ impl CachedChunkStore {
                     dc.put(&key, &raw).await?;
                 }
                 Ok::<(), ChunkError>(())
-            }
-        });
-        try_join_all(futures).await?;
+            });
+        }
+        while let Some(res) = join_set.join_next().await {
+            res.map_err(|e| ChunkError::Io(std::io::Error::other(e.to_string())))??;
+        }
         Ok(())
     }
 

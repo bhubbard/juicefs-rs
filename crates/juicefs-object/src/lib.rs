@@ -1,5 +1,6 @@
 //! Object storage abstraction and backends (`Memory`, `File`, `S3`, `Gcs`, `Azure`, `Encrypted`, `Sharded`) for `JuiceFS`.
 
+#[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
 pub mod cloud;
 pub mod encrypt;
 pub mod encrypt_chunked;
@@ -7,6 +8,7 @@ pub mod error;
 pub mod file;
 pub mod memory;
 pub mod prefixed;
+#[cfg(feature = "s3")]
 pub mod s3;
 pub mod sharded;
 
@@ -18,13 +20,17 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use juicefs_core::Format;
 
-pub use cloud::{AzureStore, GcsStore};
+#[cfg(feature = "azure")]
+pub use cloud::AzureStore;
+#[cfg(feature = "gcs")]
+pub use cloud::GcsStore;
 pub use encrypt::EncryptedStore;
 pub use encrypt_chunked::{CHUNK_SIZE, ChunkedCipher, ChunkedEncryptedStore};
 pub use error::ObjectError;
 pub use file::FileStore;
 pub use memory::MemoryStore;
 pub use prefixed::PrefixedStore;
+#[cfg(feature = "s3")]
 pub use s3::S3Store;
 pub use sharded::ShardedStore;
 
@@ -204,10 +210,13 @@ pub fn open_from_format(format: &Format) -> Result<Arc<dyn ObjectStorage>, Objec
                 .unwrap_or(&format.bucket);
             Arc::new(FileStore::new(root)?)
         }
+        #[cfg(feature = "s3")]
         "s3" | "oss" | "cos" | "minio" | "b2" | "obs" | "bos" | "tos" => {
             Arc::new(S3Store::from_format(format)?)
         }
+        #[cfg(feature = "gcs")]
         "gs" | "gcs" => Arc::new(GcsStore::from_format(format)?),
+        #[cfg(feature = "azure")]
         "azblob" | "azure" | "wasb" => Arc::new(AzureStore::from_format(format)?),
         other => {
             return Err(ObjectError::UnsupportedBackend(other.to_owned()));

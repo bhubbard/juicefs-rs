@@ -15,9 +15,9 @@ use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use http::header::{
     ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE,
 };
@@ -785,12 +785,23 @@ async fn resolve_content_type(vfs: &Vfs, ino: Ino) -> String {
     "application/octet-stream".to_owned()
 }
 
-fn attr_mtime(attr: &Attr) -> DateTime<Utc> {
-    DateTime::from_timestamp(attr.mtime, attr.mtime_nsec).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+fn attr_mtime(attr: &Attr) -> SystemTime {
+    let Ok(secs) = u64::try_from(attr.mtime) else {
+        return UNIX_EPOCH;
+    };
+    UNIX_EPOCH
+        .checked_add(Duration::new(secs, attr.mtime_nsec))
+        .unwrap_or(UNIX_EPOCH)
 }
 
-fn format_http_date(dt: DateTime<Utc>) -> String {
-    dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+fn format_http_date(ts: SystemTime) -> String {
+    const MAX_HTTP_DATE_SECS: u64 = 253_402_300_800; // 9999-12-31T23:59:59Z + 1s
+    let clamped = match ts.duration_since(UNIX_EPOCH) {
+        Ok(dur) if dur.as_secs() < MAX_HTTP_DATE_SECS => ts,
+        Ok(_) => UNIX_EPOCH + Duration::from_secs(MAX_HTTP_DATE_SECS - 1),
+        Err(_) => UNIX_EPOCH,
+    };
+    httpdate::fmt_http_date(clamped)
 }
 
 fn empty_response(status: StatusCode) -> Response<BoxBody> {

@@ -3,10 +3,9 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use parking_lot::Mutex;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -40,7 +39,7 @@ impl std::fmt::Debug for Prefetcher {
                 .debug_struct("Prefetcher")
                 .field("parallel", &inner.parallel)
                 .field("started", &inner.started.load(Ordering::Relaxed))
-                .field("busy_len", &inner.busy.lock().len())
+                .field("busy_len", &inner.busy.lock().expect("lock poisoned").len())
                 .finish(),
             None => f.debug_struct("Prefetcher").field("parallel", &0).finish(),
         }
@@ -54,7 +53,7 @@ struct BusyGuard {
 
 impl Drop for BusyGuard {
     fn drop(&mut self) {
-        self.busy.lock().remove(&self.key);
+        self.busy.lock().expect("lock poisoned").remove(&self.key);
     }
 }
 
@@ -122,7 +121,7 @@ impl Prefetcher {
         self.ensure_started();
 
         let key = key.as_ref();
-        let mut busy = inner.busy.lock();
+        let mut busy = inner.busy.lock().expect("lock poisoned");
         if busy.contains(key) {
             return false;
         }
@@ -145,7 +144,7 @@ impl Prefetcher {
         let Ok(handle) = Handle::try_current() else {
             return;
         };
-        let _guard = inner.start_lock.lock();
+        let _guard = inner.start_lock.lock().expect("lock poisoned");
         if inner.started.load(Ordering::Relaxed) {
             return;
         }

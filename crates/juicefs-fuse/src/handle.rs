@@ -1,10 +1,10 @@
 //! Open file-handle tracking for [`crate::JuiceFsFuse`].
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use juicefs_core::Ino;
-use parking_lot::RwLock;
 
 use crate::error::FuseError;
 
@@ -56,16 +56,23 @@ impl HandleTable {
             dirty: false,
             flock_owners: BTreeSet::new(),
         };
-        self.handles.write().insert(fh, handle);
+        self.handles
+            .write()
+            .expect("lock poisoned")
+            .insert(fh, handle);
         fh
     }
 
     pub(crate) fn get(&self, fh: u64) -> Option<OpenFileHandle> {
-        self.handles.read().get(&fh).cloned()
+        self.handles
+            .read()
+            .expect("lock poisoned")
+            .get(&fh)
+            .cloned()
     }
 
     pub(crate) fn validate(&self, inode: Ino, fh: u64) -> Result<OpenFileHandle, FuseError> {
-        let guard = self.handles.read();
+        let guard = self.handles.read().expect("lock poisoned");
         let handle = guard
             .get(&fh)
             .ok_or_else(|| FuseError::bad_fd(format!("invalid file handle {fh}")))?;
@@ -79,7 +86,7 @@ impl HandleTable {
     }
 
     pub(crate) fn set_dirty(&self, inode: Ino, fh: u64, dirty: bool) -> Result<(), FuseError> {
-        let mut guard = self.handles.write();
+        let mut guard = self.handles.write().expect("lock poisoned");
         let handle = guard
             .get_mut(&fh)
             .ok_or_else(|| FuseError::bad_fd(format!("invalid file handle {fh}")))?;
@@ -100,7 +107,7 @@ impl HandleTable {
         owner: u64,
         unlock: bool,
     ) -> Result<(), FuseError> {
-        let mut guard = self.handles.write();
+        let mut guard = self.handles.write().expect("lock poisoned");
         let handle = guard
             .get_mut(&fh)
             .ok_or_else(|| FuseError::bad_fd(format!("invalid file handle {fh}")))?;
@@ -119,7 +126,7 @@ impl HandleTable {
     }
 
     pub(crate) fn remove(&self, inode: Ino, fh: u64) -> Result<OpenFileHandle, FuseError> {
-        let mut guard = self.handles.write();
+        let mut guard = self.handles.write().expect("lock poisoned");
         let Some(existing) = guard.get(&fh) else {
             return Err(FuseError::bad_fd(format!("invalid file handle {fh}")));
         };
@@ -135,6 +142,6 @@ impl HandleTable {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.handles.read().len()
+        self.handles.read().expect("lock poisoned").len()
     }
 }

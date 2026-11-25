@@ -8,17 +8,22 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["s3", "gcs", "azure"]
+s3 = ["dep:object_store", "dep:futures", "dep:url", "object_store/aws"]
+gcs = ["dep:object_store", "dep:futures", "dep:url", "object_store/gcp"]
+azure = ["dep:object_store", "dep:futures", "dep:url", "object_store/azure"]
+
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
-futures.workspace = true
+futures = { version = "0.3", optional = true }
 juicefs-core.workspace = true
-object_store.workspace = true
-parking_lot.workspace = true
+object_store = { version = "0.12", default-features = false, optional = true }
 ring = "0.17"
 thiserror.workspace = true
 tokio.workspace = true
-url.workspace = true
+url = { workspace = true, optional = true }
 uuid.workspace = true
 
 [dev-dependencies]

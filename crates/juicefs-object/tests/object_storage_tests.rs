@@ -1,18 +1,25 @@
 //! Ported tests from `pkg/object/object_storage_test.go`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
 use juicefs_core::Format;
+#[cfg(feature = "azure")]
+use juicefs_object::AzureStore;
+#[cfg(feature = "gcs")]
+use juicefs_object::GcsStore;
+#[cfg(feature = "s3")]
+use juicefs_object::S3Store;
 use juicefs_object::encrypt_chunked::HEADER_SIZE;
+#[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
+use juicefs_object::open_from_format;
 use juicefs_object::{
-    AzureStore, CHUNK_SIZE, ChunkedCipher, ChunkedEncryptedStore, EncryptedStore, FileStore,
-    GcsStore, MemoryStore, ObjectError, ObjectMeta, ObjectStorage, Part, PrefixedStore, S3Store,
-    ShardedStore, open_from_format,
+    CHUNK_SIZE, ChunkedCipher, ChunkedEncryptedStore, EncryptedStore, FileStore, MemoryStore,
+    ObjectError, ObjectMeta, ObjectStorage, Part, PrefixedStore, ShardedStore,
 };
-use parking_lot::Mutex;
 use tempfile::tempdir;
 
 async fn run_object_storage_suite(store: &dyn ObjectStorage) {
@@ -552,6 +559,7 @@ async fn test_sharded_store_distribution_and_operations() {
     run_multipart_suite(&store).await;
 }
 
+#[cfg(feature = "gcs")]
 #[test]
 fn test_gcs_store_from_format_and_invalid_urls() {
     let fmt = Format::new("vol", "gs", "gs://my-gcs-bucket/path/to/prefix");
@@ -583,6 +591,7 @@ fn test_gcs_store_from_format_and_invalid_urls() {
     }
 }
 
+#[cfg(feature = "azure")]
 #[test]
 fn test_azure_store_from_format_and_invalid_urls() {
     let mut azblob_fmt = Format::new("vol", "azblob", "azblob://my-container/az/prefix");
@@ -646,6 +655,7 @@ fn test_azure_store_from_format_and_invalid_urls() {
     ));
 }
 
+#[cfg(feature = "s3")]
 #[test]
 fn test_s3_store_from_format_and_invalid_urls() {
     let fmt = Format::new("vol", "s3", "s3://my-bucket/s3/prefix/");
@@ -662,8 +672,10 @@ fn test_s3_store_from_format_and_invalid_urls() {
     }
 }
 
+#[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
 #[test]
 fn test_open_from_format_cloud_dispatch() {
+    #[cfg(feature = "s3")]
     for storage in ["s3", "oss", "cos", "minio", "b2", "obs", "bos", "tos"] {
         let url = format!("{storage}://my-bucket/prefix");
         let fmt = Format::new("vol", storage, &url);
@@ -672,6 +684,7 @@ fn test_open_from_format_cloud_dispatch() {
         assert_eq!(store.description(), format!("{url}vol/"));
     }
 
+    #[cfg(feature = "gcs")]
     for (storage, name, expected_suffix) in [("gs", "vol", "vol/"), ("gcs", "", "")] {
         let url = "gs://gcs-bucket/prefix";
         let fmt = Format::new(name, storage, url);
@@ -680,6 +693,7 @@ fn test_open_from_format_cloud_dispatch() {
         assert_eq!(store.description(), format!("{url}{expected_suffix}"));
     }
 
+    #[cfg(feature = "azure")]
     for storage in ["azblob", "azure", "wasb"] {
         let url = format!("{storage}://my-container/prefix");
         let mut fmt = Format::new("vol", storage, &url);
@@ -689,9 +703,12 @@ fn test_open_from_format_cloud_dispatch() {
         assert_eq!(store.description(), format!("{url}vol/"));
     }
 
-    let upper_fmt = Format::new("", "GCS", "gs://gcs-bucket/prefix");
-    let upper_store = open_from_format(&upper_fmt).expect("case-insensitive storage dispatch");
-    assert_eq!(upper_store.description(), "gs://gcs-bucket/prefix");
+    #[cfg(feature = "gcs")]
+    {
+        let upper_fmt = Format::new("", "GCS", "gs://gcs-bucket/prefix");
+        let upper_store = open_from_format(&upper_fmt).expect("case-insensitive storage dispatch");
+        assert_eq!(upper_store.description(), "gs://gcs-bucket/prefix");
+    }
 
     let unsupported = Format::new("vol", "swift", "swift://container/prefix");
     assert!(matches!(
@@ -755,12 +772,12 @@ impl RecordingStore {
     }
 
     fn reset(&self) {
-        self.gets.lock().clear();
+        self.gets.lock().expect("lock poisoned").clear();
         self.bytes_read.store(0, Ordering::Relaxed);
     }
 
     fn recorded_gets(&self) -> Vec<(u64, usize)> {
-        self.gets.lock().clone()
+        self.gets.lock().expect("lock poisoned").clone()
     }
 
     fn total_bytes_read(&self) -> usize {
@@ -779,7 +796,10 @@ impl ObjectStorage for RecordingStore {
     }
 
     async fn get(&self, key: &str, offset: u64, limit: usize) -> Result<Bytes, ObjectError> {
-        self.gets.lock().push((offset, limit));
+        self.gets
+            .lock()
+            .expect("lock poisoned")
+            .push((offset, limit));
         let data = self.inner.get(key, offset, limit).await?;
         self.bytes_read.fetch_add(data.len(), Ordering::Relaxed);
         Ok(data)

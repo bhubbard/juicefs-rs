@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -15,9 +15,9 @@ use juicefs_chunk::{
 };
 use juicefs_core::ChunkConfig;
 use juicefs_object::{MemoryStore, ObjectError, ObjectMeta, ObjectStorage};
-use parking_lot::Mutex;
 use tempfile::tempdir;
 use tokio::sync::Barrier;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 #[derive(Debug)]
@@ -45,7 +45,12 @@ impl CountingStore {
     }
 
     fn gets_for_key(&self, key: &str) -> usize {
-        self.key_gets.lock().get(key).copied().unwrap_or(0)
+        self.key_gets
+            .lock()
+            .expect("lock poisoned")
+            .get(key)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -77,7 +82,12 @@ impl ObjectStorage for CountingStore {
     {
         Box::pin(async move {
             self.get_calls.fetch_add(1, Ordering::SeqCst);
-            *self.key_gets.lock().entry(key.to_owned()).or_insert(0) += 1;
+            *self
+                .key_gets
+                .lock()
+                .expect("lock poisoned")
+                .entry(key.to_owned())
+                .or_insert(0) += 1;
             if !self.get_delay.is_zero() {
                 tokio::time::sleep(self.get_delay).await;
             }
@@ -280,16 +290,16 @@ async fn test_singleflight_deduplicates_concurrent_load_block() {
 
 #[tokio::test]
 async fn test_singleflight_error_and_retry() {
-    let sf: SingleFlight<u32, ChunkError> = SingleFlight::new();
+    let sf = Arc::new(SingleFlight::<u32, ChunkError>::new());
     let calls = Arc::new(AtomicUsize::new(0));
     let barrier = Arc::new(Barrier::new(8));
 
-    let mut handles = Vec::new();
+    let mut join_set = JoinSet::new();
     for _ in 0..8 {
-        let sf = &sf;
+        let sf = Arc::clone(&sf);
         let calls = Arc::clone(&calls);
         let barrier = Arc::clone(&barrier);
-        handles.push(async move {
+        join_set.spawn(async move {
             barrier.wait().await;
             sf.execute("err-key", || async {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -302,7 +312,10 @@ async fn test_singleflight_error_and_retry() {
             .await
         });
     }
-    let results = futures::future::join_all(handles).await;
+    let mut results = Vec::with_capacity(8);
+    while let Some(res) = join_set.join_next().await {
+        results.push(res.expect("join"));
+    }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(results.iter().all(Result::is_err));
     assert_eq!(sf.in_flight_count(), 0);

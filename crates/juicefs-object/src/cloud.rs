@@ -1,18 +1,21 @@
 //! Shared `object_store`-backed cloud storage adapter plus GCS and Azure Blob backends.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
+#[cfg(any(feature = "gcs", feature = "azure"))]
 use juicefs_core::Format;
 use object_store::ObjectStore as _;
+#[cfg(feature = "azure")]
 use object_store::azure::MicrosoftAzureBuilder;
+#[cfg(feature = "gcs")]
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjPath;
-use parking_lot::Mutex;
+#[cfg(any(feature = "gcs", feature = "azure"))]
 use url::Url;
 use uuid::Uuid;
 
@@ -21,9 +24,13 @@ use crate::{
     validate_key, validate_parts_order,
 };
 
+#[cfg(any(feature = "gcs", feature = "azure"))]
 const CLOUD_MIN_PART_SIZE: u64 = 5 << 20;
+#[cfg(any(feature = "gcs", feature = "azure"))]
 const CLOUD_MAX_PART_SIZE: u64 = 5 << 30;
+#[cfg(feature = "gcs")]
 const GCS_MAX_PART_COUNT: u64 = 10_000;
+#[cfg(feature = "azure")]
 const AZURE_MAX_PART_COUNT: u64 = 50_000;
 
 #[derive(Debug)]
@@ -206,7 +213,10 @@ impl ObjectStorage for CloudStore {
             upload,
             parts: BTreeMap::new(),
         }));
-        self.uploads.lock().insert(upload_id.clone(), session);
+        self.uploads
+            .lock()
+            .expect("lock poisoned")
+            .insert(upload_id.clone(), session);
         Ok(MultipartUpload {
             upload_id,
             min_part_size: self.limits.min_part_size,
@@ -230,6 +240,7 @@ impl ObjectStorage for CloudStore {
         let session = self
             .uploads
             .lock()
+            .expect("lock poisoned")
             .get(upload_id)
             .cloned()
             .ok_or_else(|| ObjectError::NotFound(format!("upload {upload_id}")))?;
@@ -257,6 +268,7 @@ impl ObjectStorage for CloudStore {
         let session = self
             .uploads
             .lock()
+            .expect("lock poisoned")
             .get(upload_id)
             .cloned()
             .ok_or_else(|| ObjectError::NotFound(format!("upload {upload_id}")))?;
@@ -291,13 +303,21 @@ impl ObjectStorage for CloudStore {
         }
         guard.upload.complete().await.map_err(|e| map_err(e, key))?;
         drop(guard);
-        self.uploads.lock().remove(upload_id);
+        self.uploads
+            .lock()
+            .expect("lock poisoned")
+            .remove(upload_id);
         Ok(())
     }
 
     async fn abort_upload(&self, key: &str, upload_id: &str) -> Result<(), ObjectError> {
         validate_key(key)?;
-        let session = self.uploads.lock().get(upload_id).cloned();
+        let session = self
+            .uploads
+            .lock()
+            .expect("lock poisoned")
+            .get(upload_id)
+            .cloned();
         let Some(session) = session else {
             return Ok(());
         };
@@ -310,7 +330,10 @@ impl ObjectStorage for CloudStore {
         }
         let res = guard.upload.abort().await.map_err(|e| map_err(e, key));
         drop(guard);
-        self.uploads.lock().remove(upload_id);
+        self.uploads
+            .lock()
+            .expect("lock poisoned")
+            .remove(upload_id);
         res
     }
 }
@@ -398,12 +421,15 @@ macro_rules! delegate_cloud_storage {
     };
 }
 
+#[cfg(feature = "s3")]
 pub(crate) use delegate_cloud_storage;
 
 /// Google Cloud Storage (`GCS`) object storage backend.
+#[cfg(feature = "gcs")]
 #[derive(Debug)]
 pub struct GcsStore(CloudStore);
 
+#[cfg(feature = "gcs")]
 impl GcsStore {
     /// Builds a [`GcsStore`] from a `JuiceFS` volume [`Format`].
     pub fn from_format(format: &Format) -> Result<Self, ObjectError> {
@@ -457,12 +483,15 @@ impl GcsStore {
     }
 }
 
+#[cfg(feature = "gcs")]
 delegate_cloud_storage!(GcsStore);
 
 /// Microsoft Azure Blob Storage object storage backend.
+#[cfg(feature = "azure")]
 #[derive(Debug)]
 pub struct AzureStore(CloudStore);
 
+#[cfg(feature = "azure")]
 impl AzureStore {
     /// Builds an [`AzureStore`] from a `JuiceFS` volume [`Format`].
     pub fn from_format(format: &Format) -> Result<Self, ObjectError> {
@@ -568,4 +597,5 @@ impl AzureStore {
     }
 }
 
+#[cfg(feature = "azure")]
 delegate_cloud_storage!(AzureStore);
