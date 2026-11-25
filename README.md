@@ -47,25 +47,25 @@ Measured on Apple Silicon (macOS, `--release` profile) against `/opt/homebrew/bi
 
 | Operation | `juicefs-rs` | `juicefs-go` | Notes |
 |---|---:|---:|---|
-| `format` (`sqlite3` + `file` + `lz4`) | **0.038 s** | 0.085 s | **2.2× faster** (creates bucket + single-tx WAL schema/init) |
-| `status` | **0.036 s** | 0.075 s | **2.1× faster** |
-| `fsck` | **0.036 s** | 0.078 s | **2.2× faster** (metadata consistency check on empty volume) |
-| `sync` (`100 × 128 KiB`, `--threads 8`) | **0.046 s** | 0.081 s | **1.8× faster** |
-| `vfs put 16 MiB` | **0.070 s** (~229 MiB/s) | — | End-to-end CLI upload |
+| `format` (`sqlite3` + `file` + `lz4`) | **0.038 s** | 0.086 s | **2.26× faster** (creates bucket + single-tx WAL schema/init) |
+| `status` | **0.040 s** | 0.073 s | **1.83× faster** |
+| `fsck` | **0.036 s** | 0.090 s | **2.50× faster** (metadata consistency check on empty volume) |
+| `sync` (`100 × 128 KiB`, `--threads 8`) | **0.047 s** | 0.092 s | **1.96× faster** |
+| `vfs put 16 MiB` | **0.074 s** (~216 MiB/s) | — | End-to-end CLI upload |
 | `vfs get 16 MiB` | **0.052 s** (~308 MiB/s) | — | End-to-end CLI download |
 
 ### Criterion Microbenchmarks (`cargo bench -p juicefs-vfs --bench vfs_bench`)
 
 | Benchmark | Mean Time | Throughput |
 |---|---:|---:|
-| `compression_1mb/compress/lz4` | 58.96 µs | 16.57 GiB/s |
-| `compression_1mb/decompress/lz4` | 30.23 µs | 32.31 GiB/s |
-| `compression_1mb/compress/zstd` | 107.75 µs | 9.06 GiB/s |
-| `compression_1mb/decompress/zstd` | 35.40 µs | 27.59 GiB/s |
-| `build_slice_100_overlapping` | 7.76 µs | — |
-| `vfs_io/write_64k_file_lz4` (`writeback: false`) | 4.05 ms | 15.42 MiB/s |
-| `vfs_io/read_64k_file_cached` (`moka`) | 63.20 µs | **988.90 MiB/s** |
-| `meta_create_and_unlink` | 185.67 µs | — |
+| `compression_1mb/compress/lz4` | 55.50 µs | 17.59 GiB/s |
+| `compression_1mb/decompress/lz4` | 26.94 µs | 36.25 GiB/s |
+| `compression_1mb/compress/zstd` | 105.77 µs | 9.23 GiB/s |
+| `compression_1mb/decompress/zstd` | 44.04 µs | 22.18 GiB/s |
+| `build_slice_100_overlapping` | 7.22 µs | — |
+| `vfs_io/write_64k_file_lz4` (`writeback: false`) | 4.77 ms | 13.12 MiB/s |
+| `vfs_io/read_64k_file_cached` (`moka`) | 63.93 µs | **977.71 MiB/s** |
+| `meta_create_and_unlink` | 207.07 µs | — |
 
 ## Testing & Verification
 
@@ -76,5 +76,5 @@ cargo test --workspace --all-features
 cargo llvm-cov --workspace --summary-only
 ```
 
-- **93 tests** passing across all 11 workspace crates (`0` failures, `0` clippy warnings).
+- **95 tests** passing across all 11 workspace crates (`0` failures, `0` clippy warnings).
 - **82.96% line coverage** (`cargo-llvm-cov`) with automated CI in [.github/workflows/ci.yml](.github/workflows/ci.yml).
