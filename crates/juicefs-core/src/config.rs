@@ -13,6 +13,7 @@ use crate::types::DEFAULT_BLOCK_SIZE;
 /// Field names use `PascalCase` JSON keys to remain compatible with Go `JuiceFS`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Format {
     /// Volume name (used as object storage prefix).
     pub name: String,
@@ -52,6 +53,15 @@ pub struct Format {
     /// Metadata schema version.
     #[serde(default = "default_meta_version")]
     pub meta_version: i32,
+    /// Enable incremental directory statistics (`dirStats`).
+    #[serde(default)]
+    pub dir_stats: bool,
+    /// Enable user and group quotas.
+    #[serde(default)]
+    pub user_group_quota: bool,
+    /// Enable metadata mutation changelog.
+    #[serde(default)]
+    pub change_log: bool,
 }
 
 const fn default_trash_days() -> i32 {
@@ -85,6 +95,9 @@ impl Format {
             inodes: 0,
             trash_days: 1,
             meta_version: 1,
+            dir_stats: false,
+            user_group_quota: false,
+            change_log: false,
         }
     }
 }

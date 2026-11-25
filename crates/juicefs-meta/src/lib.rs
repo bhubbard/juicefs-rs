@@ -1,14 +1,21 @@
-//! Metadata engine trait and `SQLite` implementation for `JuiceFS`.
+//! Metadata engine trait, `SQLite` implementation, and optional `Redis` implementation for `JuiceFS`.
 
 mod dump;
 pub mod error;
+#[cfg(feature = "redis")]
+pub mod redis_meta;
 pub mod sqlite;
+mod util;
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use juicefs_core::{Attr, Entry, Format, Ino, NodeType, SetAttrFlags, Slice, StatFs};
 use serde::{Deserialize, Serialize};
 
 pub use error::MetaError;
+#[cfg(feature = "redis")]
+pub use redis_meta::RedisMeta;
 pub use sqlite::SqliteMeta;
 
 /// Lock type for BSD (`flock`) and `POSIX` (`fcntl`) file locks.
@@ -62,6 +69,46 @@ pub struct Quota {
     pub used_space: i64,
     /// Currently used inodes under the directory subtree.
     pub used_inodes: i64,
+}
+
+/// Incremental directory statistics (`dirStats`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DirStat {
+    /// Total logical file data length in bytes under the directory.
+    pub data_length: i64,
+    /// Total 4 KiB-aligned used space in bytes under the directory.
+    pub used_space: i64,
+    /// Total number of inodes under the directory.
+    pub used_inodes: i64,
+}
+
+/// Target entity for per-user or per-group quotas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum QuotaTarget {
+    /// Quota for a specific Unix user ID (`uid`).
+    User(u32),
+    /// Quota for a specific Unix group ID (`gid`).
+    Group(u32),
+}
+
+/// Recorded metadata mutation changelog entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeLogEntry {
+    /// Monotonically increasing changelog sequence identifier.
+    pub id: i64,
+    /// Serialized mutation entry payload.
+    pub entry: String,
+}
+
+/// Client mount session metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    /// Unique session identifier.
+    pub sid: u64,
+    /// Expiration timestamp in Unix seconds.
+    pub expire: i64,
+    /// Client mount point or label.
+    pub mount_point: String,
 }
 
 /// Mismatch between stored `nlink` and the link count observed in directory edges.
@@ -286,6 +333,49 @@ pub trait Meta: Send + Sync + std::fmt::Debug {
         dst_parent: Ino,
         dst_name: &str,
     ) -> Result<(Ino, Attr), MetaError>;
+
+    /// Returns incremental directory statistics (`dirStats`) for directory `inode`.
+    async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat, MetaError>;
+
+    /// Sets or updates a user or group quota.
+    async fn set_ug_quota(
+        &self,
+        target: QuotaTarget,
+        max_space: i64,
+        max_inodes: i64,
+    ) -> Result<Quota, MetaError>;
+
+    /// Returns the configured quota for a user or group target.
+    async fn get_ug_quota(&self, target: QuotaTarget) -> Result<Quota, MetaError>;
+
+    /// Removes the configured quota for a user or group target.
+    async fn del_ug_quota(&self, target: QuotaTarget) -> Result<(), MetaError>;
+
+    /// Lists all configured user and group quotas.
+    async fn list_ug_quotas(&self) -> Result<Vec<(QuotaTarget, Quota)>, MetaError>;
+
+    /// Reads up to `limit` metadata changelog entries with `id > after_id`.
+    async fn read_changelog(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<ChangeLogEntry>, MetaError>;
+
+    /// Creates a new client session with expiration `ttl_secs` seconds from now.
+    async fn new_session(&self, mount_point: &str, ttl_secs: i64)
+    -> Result<SessionInfo, MetaError>;
+
+    /// Refreshes expiration for active session `sid` by `ttl_secs` seconds from now.
+    async fn heartbeat(&self, sid: u64, ttl_secs: i64) -> Result<(), MetaError>;
+
+    /// Closes session `sid` and releases any locks associated with it.
+    async fn close_session(&self, sid: u64) -> Result<(), MetaError>;
+
+    /// Lists all recorded sessions ordered by session ID.
+    async fn list_sessions(&self) -> Result<Vec<SessionInfo>, MetaError>;
+
+    /// Deletes all expired sessions and returns the number of removed sessions.
+    async fn cleanup_stale_sessions(&self) -> Result<u64, MetaError>;
 }
 
 /// Opens a metadata engine from a `JuiceFS` metadata URL (e.g. `sqlite3:///path/to/db`).
@@ -309,4 +399,29 @@ pub fn open_meta(meta_url: &str) -> Result<SqliteMeta, MetaError> {
     Err(MetaError::InvalidInput(format!(
         "unsupported metadata URL scheme (expected sqlite3://): {meta_url}"
     )))
+}
+
+/// Opens any supported metadata backend (`sqlite3://` or `redis://` / `rediss://`) as `Arc<dyn Meta>`.
+#[cfg_attr(
+    not(feature = "redis"),
+    expect(
+        clippy::unused_async,
+        reason = "await is used when the redis feature is enabled"
+    )
+)]
+pub async fn open_any_meta(meta_url: &str) -> Result<Arc<dyn Meta>, MetaError> {
+    if meta_url.starts_with("redis://") || meta_url.starts_with("rediss://") {
+        #[cfg(feature = "redis")]
+        {
+            let meta = RedisMeta::connect(meta_url).await?;
+            return Ok(Arc::new(meta));
+        }
+        #[cfg(not(feature = "redis"))]
+        {
+            return Err(MetaError::InvalidInput(
+                "redis metadata backend requires the `redis` feature".to_owned(),
+            ));
+        }
+    }
+    Ok(Arc::new(open_meta(meta_url)?))
 }

@@ -3,7 +3,12 @@
 use juicefs_core::{
     CHUNK_SIZE, Format, Ino, NodeType, ROOT_INODE, SetAttrFlags, Slice, TRASH_INODE,
 };
-use juicefs_meta::{FlockType, Meta, MetaError, PlockRecord, Quota, SqliteMeta, open_meta};
+#[cfg(feature = "redis")]
+use juicefs_meta::RedisMeta;
+use juicefs_meta::{
+    DirStat, FlockType, Meta, MetaError, PlockRecord, Quota, QuotaTarget, SqliteMeta,
+    open_any_meta, open_meta,
+};
 use rusqlite::Connection;
 use tempfile::tempdir;
 
@@ -769,4 +774,382 @@ async fn test_compact_chunk_atomic_with_concurrent_append() {
     let mut orphans = meta.list_orphan_slices().await.expect("orphans");
     orphans.sort_by_key(|&(id, _)| id);
     assert_eq!(orphans, vec![(s1, 100), (s2, 100), (s3, 100)]);
+}
+
+const fn dir_stat(data_length: i64, used_space: i64, used_inodes: i64) -> DirStat {
+    DirStat {
+        data_length,
+        used_space,
+        used_inodes,
+    }
+}
+
+#[tokio::test]
+async fn test_dir_stats_accumulation_and_decrement() {
+    let meta = open_meta("sqlite3://:memory:").expect("open");
+    let mut fmt = Format::new("dirstatvol", "mem", "");
+    fmt.dir_stats = true;
+    meta.init(&fmt, false).await.expect("init");
+
+    assert_eq!(
+        meta.get_dir_stat(ROOT_INODE).await.expect("root"),
+        dir_stat(0, 0, 0)
+    );
+    assert!(matches!(
+        meta.get_dir_stat(Ino(999_999)).await,
+        Err(MetaError::NotFound(_))
+    ));
+
+    let (parent, _) = meta
+        .mkdir(ROOT_INODE, "parent", 0o755, 0, 0)
+        .await
+        .expect("mkdir parent");
+    let (child, _) = meta
+        .mkdir(parent, "child", 0o755, 0, 0)
+        .await
+        .expect("mkdir child");
+    assert_eq!(
+        meta.get_dir_stat(parent).await.expect("p1"),
+        dir_stat(0, 4096, 1)
+    );
+    assert_eq!(
+        meta.get_dir_stat(ROOT_INODE).await.expect("r1"),
+        dir_stat(0, 8192, 2)
+    );
+
+    let (file, _) = meta
+        .mknod(child, "data.bin", NodeType::File, 0o644, 0, 0)
+        .await
+        .expect("mknod");
+    assert!(matches!(
+        meta.get_dir_stat(file).await,
+        Err(MetaError::NotDir(_))
+    ));
+    assert_eq!(
+        meta.get_dir_stat(child).await.expect("c1"),
+        dir_stat(0, 4096, 1)
+    );
+
+    let sid = meta.new_slice().await.expect("new_slice");
+    meta.write_chunk(file, 0, 0, full_slice(sid, 5000), 5000)
+        .await
+        .expect("write_chunk");
+    assert_eq!(
+        meta.get_dir_stat(child).await.expect("c2"),
+        dir_stat(5000, 8192, 1)
+    );
+    assert_eq!(
+        meta.get_dir_stat(parent).await.expect("p2"),
+        dir_stat(5000, 12288, 2)
+    );
+    assert_eq!(
+        meta.get_dir_stat(ROOT_INODE).await.expect("r2"),
+        dir_stat(5000, 16384, 3)
+    );
+
+    meta.truncate(file, 100).await.expect("truncate");
+    assert_eq!(
+        meta.get_dir_stat(child).await.expect("c3"),
+        dir_stat(100, 4096, 1)
+    );
+
+    meta.unlink(child, "data.bin").await.expect("unlink");
+    assert_eq!(
+        meta.get_dir_stat(child).await.expect("c4"),
+        dir_stat(0, 0, 0)
+    );
+    assert_eq!(
+        meta.get_dir_stat(parent).await.expect("p3"),
+        dir_stat(0, 4096, 1)
+    );
+
+    meta.rmdir(parent, "child").await.expect("rmdir child");
+    assert_eq!(
+        meta.get_dir_stat(parent).await.expect("p4"),
+        dir_stat(0, 0, 0)
+    );
+    meta.rmdir(ROOT_INODE, "parent")
+        .await
+        .expect("rmdir parent");
+    assert_eq!(
+        meta.get_dir_stat(ROOT_INODE).await.expect("r3"),
+        dir_stat(0, 0, 0)
+    );
+}
+
+const fn quota(max_space: i64, max_inodes: i64, used_space: i64, used_inodes: i64) -> Quota {
+    Quota {
+        max_space,
+        max_inodes,
+        used_space,
+        used_inodes,
+    }
+}
+
+#[tokio::test]
+async fn test_user_group_quota_crud_and_enforcement() {
+    let meta = open_meta("sqlite3://:memory:").expect("open");
+    let mut fmt = Format::new("ugquotavol", "mem", "");
+    fmt.user_group_quota = true;
+    meta.init(&fmt, false).await.expect("init");
+
+    let (pre, _) = meta
+        .mknod(ROOT_INODE, "pre.bin", NodeType::File, 0o644, 1000, 2000)
+        .await
+        .expect("mknod pre");
+    let sid1 = meta.new_slice().await.expect("sid1");
+    meta.write_chunk(pre, 0, 0, full_slice(sid1, 50), 50)
+        .await
+        .expect("write pre");
+
+    assert!(matches!(
+        meta.get_ug_quota(QuotaTarget::User(1000)).await,
+        Err(MetaError::NotFound(_))
+    ));
+
+    let uq = meta
+        .set_ug_quota(QuotaTarget::User(1000), 200, 3)
+        .await
+        .expect("set user quota");
+    assert_eq!(uq, quota(200, 3, 50, 1));
+    let gq = meta
+        .set_ug_quota(QuotaTarget::Group(2000), 500, 2)
+        .await
+        .expect("set group quota");
+    assert_eq!(gq, quota(500, 2, 50, 1));
+
+    let uq_upd = meta
+        .set_ug_quota(QuotaTarget::User(1000), 150, 3)
+        .await
+        .expect("update user quota");
+    assert_eq!(uq_upd.max_space, 150);
+    assert_eq!(uq_upd.used_space, 50);
+    assert_eq!(
+        meta.list_ug_quotas().await.expect("list_ug_quotas"),
+        vec![
+            (QuotaTarget::User(1000), uq_upd),
+            (QuotaTarget::Group(2000), gq)
+        ]
+    );
+
+    let (f2, _) = meta
+        .mknod(ROOT_INODE, "f2.bin", NodeType::File, 0o644, 1000, 2000)
+        .await
+        .expect("mknod f2");
+    assert!(matches!(
+        meta.mknod(ROOT_INODE, "f3.bin", NodeType::File, 0o644, 1000, 2000)
+            .await,
+        Err(MetaError::QuotaExceeded(_))
+    ));
+
+    let sid2 = meta.new_slice().await.expect("sid2");
+    assert!(matches!(
+        meta.write_chunk(f2, 0, 0, full_slice(sid2, 120), 120).await,
+        Err(MetaError::QuotaExceeded(_))
+    ));
+
+    meta.write_chunk(f2, 0, 0, full_slice(sid2, 80), 80)
+        .await
+        .expect("write 80");
+    assert_eq!(
+        meta.get_ug_quota(QuotaTarget::User(1000))
+            .await
+            .expect("u")
+            .used_space,
+        130
+    );
+
+    meta.truncate(f2, 20).await.expect("truncate f2");
+    assert_eq!(
+        meta.get_ug_quota(QuotaTarget::Group(2000))
+            .await
+            .expect("g")
+            .used_space,
+        70
+    );
+
+    meta.unlink(ROOT_INODE, "f2.bin").await.expect("unlink f2");
+    let after_unlink = meta
+        .get_ug_quota(QuotaTarget::User(1000))
+        .await
+        .expect("after unlink");
+    assert_eq!((after_unlink.used_space, after_unlink.used_inodes), (50, 1));
+
+    meta.del_ug_quota(QuotaTarget::User(1000))
+        .await
+        .expect("del user quota");
+    meta.del_ug_quota(QuotaTarget::Group(2000))
+        .await
+        .expect("del group quota");
+    assert!(matches!(
+        meta.del_ug_quota(QuotaTarget::User(1000)).await,
+        Err(MetaError::NotFound(_))
+    ));
+    assert_eq!(meta.list_ug_quotas().await.expect("empty"), vec![]);
+}
+
+#[tokio::test]
+async fn test_changelog_recording_and_pagination() {
+    // Disabled by default
+    let disabled = setup_meta().await;
+    disabled
+        .mknod(ROOT_INODE, "ignored.txt", NodeType::File, 0o644, 0, 0)
+        .await
+        .expect("mknod disabled");
+    assert_eq!(
+        disabled
+            .read_changelog(0, 100)
+            .await
+            .expect("read disabled"),
+        vec![]
+    );
+
+    // Enabled
+    let meta = open_meta("sqlite3://:memory:").expect("open");
+    let mut fmt = Format::new("changelogvol", "mem", "");
+    fmt.change_log = true;
+    meta.init(&fmt, false).await.expect("init");
+
+    let (dir, _) = meta
+        .mkdir(ROOT_INODE, "logs", 0o755, 0, 0)
+        .await
+        .expect("mkdir");
+    let (file, _) = meta
+        .mknod(dir, "app.log", NodeType::File, 0o644, 0, 0)
+        .await
+        .expect("mknod");
+    let sid = meta.new_slice().await.expect("new_slice");
+    meta.write_chunk(file, 0, 0, full_slice(sid, 16), 16)
+        .await
+        .expect("write_chunk");
+    meta.rename(dir, "app.log", dir, "app.log.1")
+        .await
+        .expect("rename");
+    meta.unlink(dir, "app.log.1").await.expect("unlink");
+    meta.rmdir(ROOT_INODE, "logs").await.expect("rmdir");
+
+    assert_eq!(meta.read_changelog(0, 0).await.expect("limit 0"), vec![]);
+
+    let p1 = meta.read_changelog(0, 2).await.expect("page 1");
+    assert_eq!(p1.len(), 2);
+    assert!(p1[0].entry.contains("MKDIR"));
+    assert!(p1[1].entry.contains("CREATE"));
+
+    let p2 = meta.read_changelog(p1[1].id, 2).await.expect("page 2");
+    assert_eq!(p2.len(), 2);
+    assert!(p2[0].entry.contains("WRITE"));
+    assert!(p2[1].entry.contains("RENAME"));
+
+    let p3 = meta.read_changelog(p2[1].id, 2).await.expect("page 3");
+    assert_eq!(p3.len(), 2);
+    assert!(p3[0].entry.contains("UNLINK"));
+    assert!(p3[1].entry.contains("RMDIR"));
+
+    let p4 = meta.read_changelog(p3[1].id, 2).await.expect("page 4");
+    assert_eq!(p4, vec![]);
+
+    let all = meta.read_changelog(0, 100).await.expect("all");
+    assert_eq!(all.len(), 6);
+    assert!(all.windows(2).all(|w| w[0].id < w[1].id));
+}
+
+#[tokio::test]
+async fn test_session_lifecycle_and_stale_cleanup() {
+    let meta = setup_meta().await;
+
+    let s1 = meta.new_session("/mnt/active", 60).await.expect("s1");
+    let s2 = meta.new_session("/mnt/expired-zero", 0).await.expect("s2");
+    let s3 = meta.new_session("/mnt/expired-neg", -10).await.expect("s3");
+    assert!(s1.sid < s2.sid && s2.sid < s3.sid);
+    assert_eq!(s1.mount_point, "/mnt/active");
+
+    let sessions = meta.list_sessions().await.expect("list_sessions");
+    assert_eq!(sessions.len(), 3);
+    assert_eq!(sessions[0].sid, s1.sid);
+    assert_eq!(sessions[1].sid, s2.sid);
+    assert_eq!(sessions[2].sid, s3.sid);
+
+    meta.heartbeat(s1.sid, 120).await.expect("heartbeat");
+    assert!(matches!(
+        meta.heartbeat(999_999, 60).await,
+        Err(MetaError::NotFound(_))
+    ));
+    let refreshed = meta.list_sessions().await.expect("list after heartbeat");
+    assert!(refreshed[0].expire >= s1.expire);
+
+    let cleaned = meta
+        .cleanup_stale_sessions()
+        .await
+        .expect("cleanup_stale_sessions");
+    assert_eq!(cleaned, 2);
+
+    let remaining = meta.list_sessions().await.expect("remaining sessions");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].sid, s1.sid);
+
+    meta.close_session(s1.sid).await.expect("close_session");
+    assert_eq!(meta.list_sessions().await.expect("empty sessions"), vec![]);
+    assert!(matches!(
+        meta.close_session(s1.sid).await,
+        Err(MetaError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_open_any_meta_and_redis_key_url_validation() {
+    let meta = open_any_meta("sqlite3://:memory:")
+        .await
+        .expect("open_any_meta sqlite");
+    let fmt = Format::new("anyvol", "mem", "");
+    meta.init(&fmt, false).await.expect("init");
+    assert_eq!(meta.load().await.expect("load").name, "anyvol");
+
+    assert!(matches!(
+        open_any_meta("http://unsupported.local").await,
+        Err(MetaError::InvalidInput(_))
+    ));
+
+    #[cfg(feature = "redis")]
+    {
+        assert_eq!(RedisMeta::SETTING_KEY, "setting");
+        assert_eq!(RedisMeta::NEXT_INODE_KEY, "nextInode");
+        assert_eq!(RedisMeta::NEXT_CHUNK_KEY, "nextChunk");
+        assert_eq!(RedisMeta::inode_key(Ino(42)), "i42");
+        assert_eq!(RedisMeta::dir_key(ROOT_INODE), "d1");
+        assert_eq!(RedisMeta::chunk_key(Ino(7), 3), "c7_3");
+        assert_eq!(RedisMeta::symlink_key(Ino(9)), "sym9");
+        assert_eq!(RedisMeta::xattr_key(Ino(11)), "x11");
+
+        RedisMeta::validate_url("redis://127.0.0.1:6379/0").expect("valid redis url");
+        RedisMeta::validate_url("rediss://user:pass@redis.example.com:6380/1")
+            .expect("valid rediss url");
+
+        for bad in [
+            "sqlite3://:memory:",
+            "redis://",
+            "redis:///0",
+            "redis://:6379",
+        ] {
+            assert!(
+                matches!(
+                    RedisMeta::validate_url(bad),
+                    Err(MetaError::InvalidInput(_))
+                ),
+                "expected InvalidInput for {bad}"
+            );
+        }
+
+        assert!(matches!(
+            open_any_meta("redis://").await,
+            Err(MetaError::InvalidInput(_))
+        ));
+    }
+
+    #[cfg(not(feature = "redis"))]
+    {
+        assert!(matches!(
+            open_any_meta("redis://127.0.0.1:6379/0").await,
+            Err(MetaError::InvalidInput(_))
+        ));
+    }
 }

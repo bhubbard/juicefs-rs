@@ -11,48 +11,48 @@ use serde::{Deserialize, Serialize};
 use crate::{MetaError, Quota};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DumpedXattr {
-    name: String,
-    value: Vec<u8>,
+pub(crate) struct DumpedXattr {
+    pub(crate) name: String,
+    pub(crate) value: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DumpedChunk {
-    indx: u32,
-    slices: Vec<SliceRecord>,
+pub(crate) struct DumpedChunk {
+    pub(crate) indx: u32,
+    pub(crate) slices: Vec<SliceRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DumpedOrphanSlice {
-    id: u64,
-    size: u32,
+pub(crate) struct DumpedOrphanSlice {
+    pub(crate) id: u64,
+    pub(crate) size: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DumpedEntry {
-    inode: Ino,
-    attr: Attr,
+pub(crate) struct DumpedEntry {
+    pub(crate) inode: Ino,
+    pub(crate) attr: Attr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    symlink: Option<String>,
+    pub(crate) symlink: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    xattrs: Vec<DumpedXattr>,
+    pub(crate) xattrs: Vec<DumpedXattr>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    chunks: Vec<DumpedChunk>,
+    pub(crate) chunks: Vec<DumpedChunk>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    entries: BTreeMap<String, DumpedEntry>,
+    pub(crate) entries: BTreeMap<String, DumpedEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DumpedMeta {
-    format: Format,
-    counters: BTreeMap<String, i64>,
+pub(crate) struct DumpedMeta {
+    pub(crate) format: Format,
+    pub(crate) counters: BTreeMap<String, i64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    quotas: BTreeMap<u64, Quota>,
+    pub(crate) quotas: BTreeMap<u64, Quota>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    orphan_slices: Vec<DumpedOrphanSlice>,
-    tree: DumpedEntry,
+    pub(crate) orphan_slices: Vec<DumpedOrphanSlice>,
+    pub(crate) tree: DumpedEntry,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    trash: Option<DumpedEntry>,
+    pub(crate) trash: Option<DumpedEntry>,
 }
 
 fn read_node_attr(conn: &Connection, inode: Ino) -> Result<Option<Attr>, MetaError> {
@@ -326,6 +326,10 @@ pub(crate) fn load_from_json(conn: &mut Connection, json: &str) -> Result<(), Me
          DELETE FROM jfs_symlink;
          DELETE FROM jfs_xattr;
          DELETE FROM jfs_dir_quota;
+         DELETE FROM jfs_ug_quota;
+         DELETE FROM jfs_dirstats;
+         DELETE FROM jfs_changelog;
+         DELETE FROM jfs_session2;
          DELETE FROM jfs_flock;
          DELETE FROM jfs_plock;",
     )?;

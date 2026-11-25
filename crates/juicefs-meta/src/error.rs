@@ -56,4 +56,15 @@ pub enum MetaError {
     /// Background task join error.
     #[error("task error: {0}")]
     Task(String),
+
+    /// Redis metadata backend error.
+    #[error("redis error: {0}")]
+    Redis(String),
+}
+
+#[cfg(feature = "redis")]
+impl From<redis::RedisError> for MetaError {
+    fn from(err: redis::RedisError) -> Self {
+        Self::Redis(err.to_string())
+    }
 }

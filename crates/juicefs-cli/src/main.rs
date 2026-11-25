@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use juicefs_core::{ChunkConfig, ClientConfig, Format, NodeType};
 use juicefs_gateway::GatewayServer;
-use juicefs_meta::{Meta, open_meta};
+use juicefs_meta::{Meta, open_any_meta, open_meta};
 use juicefs_object::{FileStore, MemoryStore, ObjectStorage, S3Store};
 use juicefs_sync::{SyncConfig, sync_objects};
 use juicefs_vfs::Vfs;
@@ -276,6 +276,22 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:9007")]
         listen: SocketAddr,
     },
+    /// Print metadata mutation changelog entries
+    Changelog {
+        /// Metadata URL
+        meta_url: String,
+        /// Return entries with `id > after`
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        /// Maximum entries to return
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// List active client sessions
+    Sessions {
+        /// Metadata URL
+        meta_url: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -315,7 +331,9 @@ enum QuotaAction {
 }
 
 async fn connect_vfs(meta_url: &str) -> Result<Vfs> {
-    let meta = Arc::new(open_meta(meta_url).context("opening metadata store")?);
+    let meta = open_any_meta(meta_url)
+        .await
+        .context("opening metadata store")?;
     Vfs::connect(meta, ChunkConfig::default(), ClientConfig::default())
         .await
         .context("connecting to JuiceFS volume")
@@ -648,6 +666,29 @@ async fn dispatch_admin(command: Commands) -> Result<()> {
         } => cmd_bench(&meta_url, &path, size_mb).await?,
         Commands::Objbench { uri, size_mb } => cmd_objbench(&uri, size_mb).await?,
         Commands::Quota { action } => cmd_quota(action).await?,
+        Commands::Changelog {
+            meta_url,
+            after,
+            limit,
+        } => {
+            let meta = open_any_meta(&meta_url)
+                .await
+                .context("opening metadata store")?;
+            for item in meta.read_changelog(after, limit).await? {
+                println!("{}: {}", item.id, item.entry);
+            }
+        }
+        Commands::Sessions { meta_url } => {
+            let meta = open_any_meta(&meta_url)
+                .await
+                .context("opening metadata store")?;
+            for sess in meta.list_sessions().await? {
+                println!(
+                    "sid={} expire={} mount={}",
+                    sess.sid, sess.expire, sess.mount_point
+                );
+            }
+        }
         _ => unreachable!(),
     }
     Ok(())
@@ -744,7 +785,9 @@ async fn dispatch(command: Commands) -> Result<()> {
         | Commands::Fsck { .. }
         | Commands::Bench { .. }
         | Commands::Objbench { .. }
-        | Commands::Quota { .. }) => dispatch_admin(cmd).await?,
+        | Commands::Quota { .. }
+        | Commands::Changelog { .. }
+        | Commands::Sessions { .. }) => dispatch_admin(cmd).await?,
         other => dispatch_io(other).await?,
     }
     Ok(())

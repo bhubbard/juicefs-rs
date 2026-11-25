@@ -1,20 +1,27 @@
 //! `SQLite` metadata engine compatible with `JuiceFS` SQL schema conventions.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use juicefs_core::{
-    Attr, CHUNK_SIZE, Entry, Format, Ino, MAX_NAME, MAX_SYMLINK, NodeType, ROOT_INODE, SLICE_BYTES,
+    Attr, CHUNK_SIZE, Entry, Format, Ino, MAX_SYMLINK, NodeType, ROOT_INODE, SLICE_BYTES,
     SetAttrFlags, Slice, SliceRecord, StatFs, TRASH_INODE, build_slice, decode_slices,
     encode_slice,
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::{FlockType, FsckReport, Meta, MetaError, NlinkMismatch, PlockRecord, Quota};
+use crate::util::{
+    align4k, decode_plocks, decode_session_mount_point, encode_plocks, encode_session_info,
+    make_trash_entry_name, now_ns, now_secs, parse_trash_entry_name, split_ns, update_plocks,
+    validate_name,
+};
+use crate::{
+    ChangeLogEntry, DirStat, FlockType, FsckReport, Meta, MetaError, NlinkMismatch, PlockRecord,
+    Quota, QuotaTarget, SessionInfo,
+};
 
 const SCHEMA_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS jfs_setting (
@@ -102,6 +109,30 @@ CREATE TABLE IF NOT EXISTS jfs_dir_quota (
     used_space INTEGER NOT NULL,
     used_inodes INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS jfs_dirstats (
+    inode INTEGER PRIMARY KEY,
+    data_length INTEGER NOT NULL DEFAULT 0,
+    used_space INTEGER NOT NULL DEFAULT 0,
+    used_inodes INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS jfs_ug_quota (
+    qtype INTEGER NOT NULL,
+    qkey INTEGER NOT NULL,
+    max_space INTEGER NOT NULL,
+    max_inodes INTEGER NOT NULL,
+    used_space INTEGER NOT NULL,
+    used_inodes INTEGER NOT NULL,
+    PRIMARY KEY(qtype, qkey)
+);
+CREATE TABLE IF NOT EXISTS jfs_changelog (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jfs_session2 (
+    sid INTEGER PRIMARY KEY,
+    expire INTEGER NOT NULL,
+    info BLOB
+);
 ";
 
 /// SQLite-backed [`Meta`] engine.
@@ -146,26 +177,6 @@ impl SqliteMeta {
         .await
         .map_err(|e| MetaError::Task(e.to_string()))?
     }
-}
-
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i64)
-}
-
-fn split_ns(ns: i64) -> (i64, i64) {
-    (ns / 1_000, ns % 1_000)
-}
-
-fn validate_name(name: &str) -> Result<(), MetaError> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.len() > MAX_NAME
-    {
-        return Err(MetaError::InvalidInput(format!(
-            "invalid entry name: {name:?}"
-        )));
-    }
-    Ok(())
 }
 
 fn next_counter(tx: &Transaction<'_>, name: &str, delta: i64) -> Result<i64, MetaError> {
@@ -475,118 +486,6 @@ fn file_parent_dirs(conn: &Connection, inode: Ino, attr: &Attr) -> Result<Vec<In
     Ok(dirs)
 }
 
-fn encode_plocks(records: &[PlockRecord]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(records.len() * 24);
-    for rec in records {
-        out.extend_from_slice(&u32::from(rec.typ as u8).to_be_bytes());
-        out.extend_from_slice(&rec.pid.to_be_bytes());
-        out.extend_from_slice(&rec.start.to_be_bytes());
-        out.extend_from_slice(&rec.end.to_be_bytes());
-    }
-    out
-}
-
-fn decode_plocks(bytes: &[u8]) -> Result<Vec<PlockRecord>, MetaError> {
-    let (chunks, rem) = bytes.as_chunks::<24>();
-    if !rem.is_empty() {
-        return Err(MetaError::InvalidInput(format!(
-            "corrupt plock record length: {}",
-            bytes.len()
-        )));
-    }
-    let mut out = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        let typ_raw = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        let typ = FlockType::try_from(
-            u8::try_from(typ_raw)
-                .map_err(|_| MetaError::InvalidInput(format!("invalid plock type: {typ_raw}")))?,
-        )?;
-        let pid = u32::from_be_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-        let start = u64::from_be_bytes([
-            chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],
-        ]);
-        let end = u64::from_be_bytes([
-            chunk[16], chunk[17], chunk[18], chunk[19], chunk[20], chunk[21], chunk[22], chunk[23],
-        ]);
-        out.push(PlockRecord {
-            typ,
-            pid,
-            start,
-            end,
-        });
-    }
-    Ok(out)
-}
-
-fn update_plocks(mut ls: Vec<PlockRecord>, nl: PlockRecord) -> Vec<PlockRecord> {
-    if nl.start > nl.end {
-        return ls;
-    }
-    let mut rem = Some(nl);
-    let orig_len = ls.len();
-    for i in 0..orig_len {
-        let Some(mut cur_nl) = rem else {
-            break;
-        };
-        let mut l = ls[i];
-        if cur_nl.start < l.start && cur_nl.end >= l.start {
-            let mut prefix = cur_nl;
-            prefix.end = l.start - 1;
-            ls.push(prefix);
-            cur_nl.start = l.start;
-        }
-        if cur_nl.start > l.start && cur_nl.start <= l.end {
-            let mut before = l;
-            before.end = cur_nl.start - 1;
-            ls.push(before);
-            ls[i].start = cur_nl.start;
-            l.start = cur_nl.start;
-        }
-        if cur_nl.start == l.start {
-            ls[i].typ = cur_nl.typ;
-            ls[i].pid = cur_nl.pid;
-            if l.end > cur_nl.end {
-                let mut after = l;
-                after.start = cur_nl.end + 1;
-                ls[i].end = cur_nl.end;
-                ls.push(after);
-            }
-            rem = ls[i]
-                .end
-                .checked_add(1)
-                .filter(|&s| s <= cur_nl.end)
-                .map(|s| {
-                    cur_nl.start = s;
-                    cur_nl
-                });
-        } else {
-            rem = Some(cur_nl);
-        }
-    }
-    if let Some(tail) = rem
-        && tail.start <= tail.end
-    {
-        ls.push(tail);
-    }
-
-    ls.sort_by_key(|r| r.start);
-    ls.retain(|r| r.typ != FlockType::Unlock && r.start <= r.end);
-
-    let mut merged: Vec<PlockRecord> = Vec::with_capacity(ls.len());
-    for rec in ls {
-        if let Some(last) = merged.last_mut()
-            && last.typ == rec.typ
-            && last.pid == rec.pid
-            && last.end.checked_add(1) == Some(rec.start)
-        {
-            last.end = rec.end;
-        } else {
-            merged.push(rec);
-        }
-    }
-    merged
-}
-
 fn ensure_trash_node(tx: &Transaction<'_>, now: i64) -> Result<(), MetaError> {
     let exists: Option<i64> = tx
         .query_row(
@@ -616,39 +515,6 @@ fn ensure_trash_node(tx: &Transaction<'_>, now: i64) -> Result<(), MetaError> {
     Ok(())
 }
 
-fn make_trash_entry_name(parent: Ino, inode: Ino, name: &str) -> String {
-    let full = format!("{}-{}-{name}", parent.as_u64(), inode.as_u64());
-    if full.len() <= MAX_NAME {
-        return full;
-    }
-    let mut end = MAX_NAME;
-    while !full.is_char_boundary(end) {
-        end -= 1;
-    }
-    full[..end].to_owned()
-}
-
-fn parse_trash_entry_name(trash_name: &str) -> Result<(Ino, Ino, &str), MetaError> {
-    let mut parts = trash_name.splitn(3, '-');
-    let parent_str = parts
-        .next()
-        .ok_or_else(|| MetaError::InvalidInput(format!("invalid trash entry: {trash_name}")))?;
-    let ino_str = parts
-        .next()
-        .ok_or_else(|| MetaError::InvalidInput(format!("invalid trash entry: {trash_name}")))?;
-    let orig_name = parts
-        .next()
-        .ok_or_else(|| MetaError::InvalidInput(format!("invalid trash entry: {trash_name}")))?;
-    let orig_parent: u64 = parent_str
-        .parse()
-        .map_err(|_| MetaError::InvalidInput(format!("invalid trash parent in: {trash_name}")))?;
-    let orig_ino: u64 = ino_str
-        .parse()
-        .map_err(|_| MetaError::InvalidInput(format!("invalid trash inode in: {trash_name}")))?;
-    validate_name(orig_name)?;
-    Ok((Ino(orig_parent), Ino(orig_ino), orig_name))
-}
-
 fn load_format_sync(conn: &Connection) -> Result<Format, MetaError> {
     let raw: Option<String> = conn
         .query_row(
@@ -659,6 +525,242 @@ fn load_format_sync(conn: &Connection) -> Result<Format, MetaError> {
         .optional()?;
     let json = raw.ok_or(MetaError::NotFormatted)?;
     Ok(serde_json::from_str(&json)?)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FormatFlags {
+    dir_stats: bool,
+    user_group_quota: bool,
+    change_log: bool,
+}
+
+fn load_format_flags(conn: &Connection) -> Result<FormatFlags, MetaError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM jfs_setting WHERE name = 'format'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(json) = raw else {
+        return Ok(FormatFlags::default());
+    };
+    let fmt: Format = serde_json::from_str(&json)?;
+    Ok(FormatFlags {
+        dir_stats: fmt.dir_stats,
+        user_group_quota: fmt.user_group_quota,
+        change_log: fmt.change_log,
+    })
+}
+
+fn ancestor_dir_inodes(conn: &Connection, dirs: &[Ino]) -> Result<Vec<Ino>, MetaError> {
+    let mut visited = BTreeSet::new();
+    for &start_dir in dirs {
+        let mut cur = start_dir;
+        while cur.is_valid() && !cur.is_trash() && visited.insert(cur.as_u64()) {
+            if cur == ROOT_INODE {
+                break;
+            }
+            let parent_opt: Option<i64> = conn
+                .query_row(
+                    "SELECT parent FROM jfs_node WHERE inode = ?1",
+                    params![cur.as_u64() as i64],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(parent_raw) = parent_opt else {
+                break;
+            };
+            let parent = Ino(parent_raw as u64);
+            if parent == cur || !parent.is_valid() {
+                break;
+            }
+            cur = parent;
+        }
+    }
+    Ok(visited.into_iter().map(Ino).collect())
+}
+
+fn apply_dir_stats_delta(
+    tx: &Transaction<'_>,
+    dirs: &[Ino],
+    delta_len: i64,
+    delta_space: i64,
+    delta_inodes: i64,
+) -> Result<(), MetaError> {
+    if delta_len == 0 && delta_space == 0 && delta_inodes == 0 {
+        return Ok(());
+    }
+    for anc in ancestor_dir_inodes(tx, dirs)? {
+        let existing: Option<(i64, i64, i64)> = tx
+            .query_row(
+                "SELECT data_length, used_space, used_inodes FROM jfs_dirstats WHERE inode = ?1",
+                params![anc.as_u64() as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let (cur_len, cur_space, cur_inodes) = existing.unwrap_or((0, 0, 0));
+        let new_len = (cur_len + delta_len).max(0);
+        let new_space = (cur_space + delta_space).max(0);
+        let new_inodes = (cur_inodes + delta_inodes).max(0);
+        tx.execute(
+            "INSERT INTO jfs_dirstats (inode, data_length, used_space, used_inodes)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(inode) DO UPDATE SET
+                data_length = ?2, used_space = ?3, used_inodes = ?4",
+            params![anc.as_u64() as i64, new_len, new_space, new_inodes],
+        )?;
+    }
+    Ok(())
+}
+
+fn calc_dir_descendant_stats(
+    conn: &Connection,
+    dir_ino: Ino,
+) -> Result<(i64, i64, i64), MetaError> {
+    let mut queue = vec![dir_ino];
+    let mut visited = HashSet::new();
+    visited.insert(dir_ino.as_u64());
+    let mut total_len: i64 = 0;
+    let mut total_space: i64 = align4k(0);
+    let mut total_inodes: i64 = 1;
+
+    while let Some(cur) = queue.pop() {
+        let mut stmt = conn.prepare("SELECT inode, type FROM jfs_edge WHERE parent = ?1")?;
+        let rows = stmt.query_map(params![cur.as_u64() as i64], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, u8>(1)?))
+        })?;
+        let mut children = Vec::new();
+        for row in rows {
+            children.push(row?);
+        }
+        drop(stmt);
+
+        for (child_u64, typ_raw) in children {
+            total_inodes += 1;
+            let typ = NodeType::try_from(typ_raw)?;
+            if typ == NodeType::Directory {
+                total_space += align4k(0);
+                if visited.insert(child_u64) {
+                    queue.push(Ino(child_u64));
+                }
+            } else {
+                let len: Option<i64> = conn
+                    .query_row(
+                        "SELECT length FROM jfs_node WHERE inode = ?1",
+                        params![child_u64 as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let len_u64 = len.unwrap_or(0).max(0) as u64;
+                total_len += len_u64 as i64;
+                total_space += align4k(len_u64);
+            }
+        }
+    }
+
+    Ok((total_len, total_space, total_inodes))
+}
+
+const fn ug_quota_key(target: QuotaTarget) -> (u8, i64) {
+    match target {
+        QuotaTarget::User(uid) => (1, uid as i64),
+        QuotaTarget::Group(gid) => (2, gid as i64),
+    }
+}
+
+fn ug_quota_from_row(qtype: u8, qkey: i64) -> Result<QuotaTarget, MetaError> {
+    let key = u32::try_from(qkey)
+        .map_err(|_| MetaError::InvalidInput(format!("invalid quota id: {qkey}")))?;
+    match qtype {
+        1 => Ok(QuotaTarget::User(key)),
+        2 => Ok(QuotaTarget::Group(key)),
+        other => Err(MetaError::InvalidInput(format!(
+            "invalid ug quota type: {other}"
+        ))),
+    }
+}
+
+fn read_ug_quota_opt(conn: &Connection, target: QuotaTarget) -> Result<Option<Quota>, MetaError> {
+    let (qtype, qkey) = ug_quota_key(target);
+    Ok(conn
+        .query_row(
+            "SELECT max_space, max_inodes, used_space, used_inodes
+             FROM jfs_ug_quota WHERE qtype = ?1 AND qkey = ?2",
+            params![qtype, qkey],
+            |r| {
+                Ok(Quota {
+                    max_space: r.get(0)?,
+                    max_inodes: r.get(1)?,
+                    used_space: r.get(2)?,
+                    used_inodes: r.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn apply_ug_quota_target_delta(
+    tx: &Transaction<'_>,
+    targets: &[QuotaTarget],
+    delta_space: i64,
+    delta_inodes: i64,
+) -> Result<(), MetaError> {
+    if delta_space == 0 && delta_inodes == 0 {
+        return Ok(());
+    }
+    let mut loaded = Vec::new();
+    for &target in targets {
+        if let Some(q) = read_ug_quota_opt(tx, target)? {
+            if delta_space > 0 && q.max_space > 0 && q.used_space + delta_space > q.max_space {
+                return Err(MetaError::QuotaExceeded(format!(
+                    "{target:?} space quota exceeded ({} + {} > {})",
+                    q.used_space, delta_space, q.max_space
+                )));
+            }
+            if delta_inodes > 0 && q.max_inodes > 0 && q.used_inodes + delta_inodes > q.max_inodes {
+                return Err(MetaError::QuotaExceeded(format!(
+                    "{target:?} inode quota exceeded ({} + {} > {})",
+                    q.used_inodes, delta_inodes, q.max_inodes
+                )));
+            }
+            loaded.push((target, q));
+        }
+    }
+    for (target, q) in loaded {
+        let (qtype, qkey) = ug_quota_key(target);
+        let new_space = (q.used_space + delta_space).max(0);
+        let new_inodes = (q.used_inodes + delta_inodes).max(0);
+        tx.execute(
+            "UPDATE jfs_ug_quota SET used_space = ?1, used_inodes = ?2 WHERE qtype = ?3 AND qkey = ?4",
+            params![new_space, new_inodes, qtype, qkey],
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_ug_quota_delta(
+    tx: &Transaction<'_>,
+    uid: u32,
+    gid: u32,
+    delta_space: i64,
+    delta_inodes: i64,
+) -> Result<(), MetaError> {
+    apply_ug_quota_target_delta(
+        tx,
+        &[QuotaTarget::User(uid), QuotaTarget::Group(gid)],
+        delta_space,
+        delta_inodes,
+    )
+}
+
+fn record_changelog(tx: &Transaction<'_>, entry: &serde_json::Value) -> Result<(), MetaError> {
+    let serialized = serde_json::to_string(entry)?;
+    tx.execute(
+        "INSERT INTO jfs_changelog (entry) VALUES (?1)",
+        params![serialized],
+    )?;
+    Ok(())
 }
 
 fn purge_trash_dir_recursive(tx: &Transaction<'_>, dir_ino: Ino) -> Result<u64, MetaError> {
@@ -716,6 +818,7 @@ fn remove_existing_dst(
     tx: &Transaction<'_>,
     dst_parent: Ino,
     dst_name: &str,
+    flags: FormatFlags,
 ) -> Result<(), MetaError> {
     let dst_row: Option<(i64, u8)> = tx
         .query_row(
@@ -738,8 +841,20 @@ fn remove_existing_dst(
             return Err(MetaError::NotEmpty(dst_name.to_owned()));
         }
         apply_quota_delta(tx, dst_parent, 0, -1)?;
+        let dst_ino = Ino(dst_ino_raw as u64);
+        let dst_attr = read_attr(tx, dst_ino)?;
+        if flags.user_group_quota {
+            apply_ug_quota_delta(tx, dst_attr.uid, dst_attr.gid, 0, -1)?;
+        }
+        if flags.dir_stats {
+            apply_dir_stats_delta(tx, &[dst_parent], 0, -align4k(0), -1)?;
+        }
         tx.execute(
             "DELETE FROM jfs_dir_quota WHERE inode = ?1",
+            params![dst_ino_raw],
+        )?;
+        tx.execute(
+            "DELETE FROM jfs_dirstats WHERE inode = ?1",
             params![dst_ino_raw],
         )?;
         delete_inode_auxiliary(tx, dst_ino_raw)?;
@@ -752,7 +867,25 @@ fn remove_existing_dst(
         let dst_ino = Ino(dst_ino_raw as u64);
         let dst_attr = read_attr(tx, dst_ino)?;
         apply_quota_delta(tx, dst_parent, -(dst_attr.length as i64), -1)?;
+        if flags.dir_stats {
+            apply_dir_stats_delta(
+                tx,
+                &[dst_parent],
+                -(dst_attr.length as i64),
+                -align4k(dst_attr.length),
+                -1,
+            )?;
+        }
         if dst_attr.nlink <= 1 {
+            if flags.user_group_quota {
+                apply_ug_quota_delta(
+                    tx,
+                    dst_attr.uid,
+                    dst_attr.gid,
+                    -(dst_attr.length as i64),
+                    -1,
+                )?;
+            }
             decrement_chunk_refs(tx, dst_ino)?;
             delete_inode_auxiliary(tx, dst_ino_raw)?;
             let _ = next_counter(tx, "usedInodes", -1)?;
@@ -800,7 +933,11 @@ impl Meta for SqliteMeta {
                      DELETE FROM jfs_xattr;
                      DELETE FROM jfs_flock;
                      DELETE FROM jfs_plock;
-                     DELETE FROM jfs_dir_quota;",
+                     DELETE FROM jfs_dir_quota;
+                     DELETE FROM jfs_dirstats;
+                     DELETE FROM jfs_ug_quota;
+                     DELETE FROM jfs_changelog;
+                     DELETE FROM jfs_session2;",
                 )?;
             }
             tx.execute(
@@ -938,7 +1075,10 @@ impl Meta for SqliteMeta {
         let attr = attr.clone();
         self.run(move |conn| {
             let tx = conn.transaction()?;
+            let flags = load_format_flags(&tx)?;
             let mut cur = read_attr(&tx, inode)?;
+            let prior_user = cur.uid;
+            let prior_group = cur.gid;
             let now = now_ns();
             let sec_now = now / 1_000_000_000;
             let nsec_now = (now % 1_000_000_000) as u32;
@@ -951,6 +1091,22 @@ impl Meta for SqliteMeta {
             }
             if mask.contains(SetAttrFlags::GID) {
                 cur.gid = attr.gid;
+            }
+            if flags.user_group_quota && inode != ROOT_INODE && !inode.is_trash() {
+                let space = if cur.is_file() { cur.length as i64 } else { 0 };
+                if cur.uid != prior_user {
+                    apply_ug_quota_target_delta(&tx, &[QuotaTarget::User(cur.uid)], space, 1)?;
+                    apply_ug_quota_target_delta(&tx, &[QuotaTarget::User(prior_user)], -space, -1)?;
+                }
+                if cur.gid != prior_group {
+                    apply_ug_quota_target_delta(&tx, &[QuotaTarget::Group(cur.gid)], space, 1)?;
+                    apply_ug_quota_target_delta(
+                        &tx,
+                        &[QuotaTarget::Group(prior_group)],
+                        -space,
+                        -1,
+                    )?;
+                }
             }
             if mask.contains(SetAttrFlags::ATIME_NOW) {
                 cur.atime = sec_now;
@@ -1020,6 +1176,7 @@ impl Meta for SqliteMeta {
         let name = name.to_owned();
         self.run(move |conn| {
             let tx = conn.transaction()?;
+            let flags = load_format_flags(&tx)?;
             let pattr = read_attr(&tx, parent)?;
             if !pattr.is_dir() {
                 return Err(MetaError::NotDir(format!("inode {parent}")));
@@ -1035,6 +1192,9 @@ impl Meta for SqliteMeta {
                 return Err(MetaError::AlreadyExists(name));
             }
             apply_quota_delta(&tx, parent, 0, 1)?;
+            if flags.user_group_quota {
+                apply_ug_quota_delta(&tx, uid, gid, 0, 1)?;
+            }
             let ino = Ino(next_counter(&tx, "nextInode", 1)? as u64);
             let _ = next_counter(&tx, "usedInodes", 1)?;
             let now = now_ns();
@@ -1065,6 +1225,22 @@ impl Meta for SqliteMeta {
                     typ as u8
                 ],
             )?;
+            if flags.dir_stats {
+                apply_dir_stats_delta(&tx, &[parent], 0, align4k(0), 1)?;
+            }
+            if flags.change_log {
+                record_changelog(
+                    &tx,
+                    &serde_json::json!({
+                        "op": "CREATE",
+                        "parent": parent.as_u64(),
+                        "name": name,
+                        "inode": ino.as_u64(),
+                        "type": typ as u8,
+                        "ts": now,
+                    }),
+                )?;
+            }
             update_parent_mtime(&tx, parent, now)?;
             tx.commit()?;
             Ok((ino, attr))
@@ -1084,6 +1260,7 @@ impl Meta for SqliteMeta {
         let name = name.to_owned();
         self.run(move |conn| {
             let tx = conn.transaction()?;
+            let flags = load_format_flags(&tx)?;
             let pattr = read_attr(&tx, parent)?;
             if !pattr.is_dir() {
                 return Err(MetaError::NotDir(format!("inode {parent}")));
@@ -1099,6 +1276,9 @@ impl Meta for SqliteMeta {
                 return Err(MetaError::AlreadyExists(name));
             }
             apply_quota_delta(&tx, parent, 0, 1)?;
+            if flags.user_group_quota {
+                apply_ug_quota_delta(&tx, uid, gid, 0, 1)?;
+            }
             let ino = Ino(next_counter(&tx, "nextInode", 1)? as u64);
             let _ = next_counter(&tx, "usedInodes", 1)?;
             let now = now_ns();
@@ -1133,6 +1313,21 @@ impl Meta for SqliteMeta {
                 "UPDATE jfs_node SET nlink = nlink + 1 WHERE inode = ?1",
                 params![parent.as_u64() as i64],
             )?;
+            if flags.dir_stats {
+                apply_dir_stats_delta(&tx, &[parent], 0, align4k(0), 1)?;
+            }
+            if flags.change_log {
+                record_changelog(
+                    &tx,
+                    &serde_json::json!({
+                        "op": "MKDIR",
+                        "parent": parent.as_u64(),
+                        "name": name,
+                        "inode": ino.as_u64(),
+                        "ts": now,
+                    }),
+                )?;
+            }
             update_parent_mtime(&tx, parent, now)?;
             tx.commit()?;
             Ok((ino, attr))
@@ -1156,6 +1351,7 @@ impl Meta for SqliteMeta {
         let target = target.to_owned();
         self.run(move |conn| {
             let tx = conn.transaction()?;
+            let flags = load_format_flags(&tx)?;
             let pattr = read_attr(&tx, parent)?;
             if !pattr.is_dir() {
                 return Err(MetaError::NotDir(format!("inode {parent}")));
@@ -1171,6 +1367,9 @@ impl Meta for SqliteMeta {
                 return Err(MetaError::AlreadyExists(name));
             }
             apply_quota_delta(&tx, parent, 0, 1)?;
+            if flags.user_group_quota {
+                apply_ug_quota_delta(&tx, uid, gid, 0, 1)?;
+            }
             let ino = Ino(next_counter(&tx, "nextInode", 1)? as u64);
             let _ = next_counter(&tx, "usedInodes", 1)?;
             let now = now_ns();
@@ -1206,6 +1405,15 @@ impl Meta for SqliteMeta {
                     NodeType::Symlink as u8
                 ],
             )?;
+            if flags.dir_stats {
+                apply_dir_stats_delta(
+                    &tx,
+                    &[parent],
+                    target.len() as i64,
+                    align4k(target.len() as u64),
+                    1,
+                )?;
+            }
             update_parent_mtime(&tx, parent, now)?;
             tx.commit()?;
             Ok((ino, attr))
@@ -1233,6 +1441,7 @@ impl Meta for SqliteMeta {
         let new_name = new_name.to_owned();
         self.run(move |conn| {
             let tx = conn.transaction()?;
+            let flags = load_format_flags(&tx)?;
             let pattr = read_attr(&tx, new_parent)?;
             if !pattr.is_dir() {
                 return Err(MetaError::NotDir(format!("inode {new_parent}")));
@@ -1261,6 +1470,15 @@ impl Meta for SqliteMeta {
                 ],
             )?;
             apply_quota_delta(&tx, new_parent, attr.length as i64, 1)?;
+            if flags.dir_stats {
+                apply_dir_stats_delta(
+                    &tx,
+                    &[new_parent],
+                    attr.length as i64,
+                    align4k(attr.length),
+                    1,
+                )?;
+            }
             attr.nlink += 1;
             let now = now_ns();
             let (us, sub) = split_ns(now);
@@ -1280,6 +1498,7 @@ impl Meta for SqliteMeta {
         let name = name.to_owned();
         self.run(move |conn| {
             let tx = conn.transaction()?;
+            let flags = load_format_flags(&tx)?;
             let row: Option<(i64, u8)> = tx
                 .query_row(
                     "SELECT inode, type FROM jfs_edge WHERE parent = ?1 AND name = ?2",
@@ -1298,8 +1517,20 @@ impl Meta for SqliteMeta {
             )?;
             let attr = read_attr(&tx, ino)?;
             apply_quota_delta(&tx, parent, -(attr.length as i64), -1)?;
+            if flags.dir_stats {
+                apply_dir_stats_delta(
+                    &tx,
+                    &[parent],
+                    -(attr.length as i64),
+                    -align4k(attr.length),
+                    -1,
+                )?;
+            }
             let now = now_ns();
             if attr.nlink <= 1 {
+                if flags.user_group_quota {
+                    apply_ug_quota_delta(&tx, attr.uid, attr.gid, -(attr.length as i64), -1)?;
+                }
                 decrement_chunk_refs(&tx, ino)?;
                 delete_inode_auxiliary(&tx, ino_raw)?;
                 let _ = next_counter(&tx, "usedInodes", -1)?;
@@ -1309,6 +1540,18 @@ impl Meta for SqliteMeta {
                 tx.execute(
                     "UPDATE jfs_node SET nlink = nlink - 1, ctime = ?1, ctimensec = ?2 WHERE inode = ?3",
                     params![us, sub, ino_raw],
+                )?;
+            }
+            if flags.change_log {
+                record_changelog(
+                    &tx,
+                    &serde_json::json!({
+                        "op": "UNLINK",
+                        "parent": parent.as_u64(),
+                        "name": name,
+                        "inode": ino.as_u64(),
+                        "ts": now,
+                    }),
                 )?;
             }
             update_parent_mtime(&tx, parent, now)?;
@@ -1323,6 +1566,7 @@ impl Meta for SqliteMeta {
         let name = name.to_owned();
         self.run(move |conn| {
             let tx = conn.transaction()?;
+            let flags = load_format_flags(&tx)?;
             let row: Option<(i64, u8)> = tx
                 .query_row(
                     "SELECT inode, type FROM jfs_edge WHERE parent = ?1 AND name = ?2",
@@ -1342,13 +1586,24 @@ impl Meta for SqliteMeta {
             if child_count > 0 {
                 return Err(MetaError::NotEmpty(name));
             }
+            let dir_attr = read_attr(&tx, Ino(ino_raw as u64))?;
             tx.execute(
                 "DELETE FROM jfs_edge WHERE parent = ?1 AND name = ?2",
                 params![parent.as_u64() as i64, name.as_bytes()],
             )?;
             apply_quota_delta(&tx, parent, 0, -1)?;
+            if flags.user_group_quota {
+                apply_ug_quota_delta(&tx, dir_attr.uid, dir_attr.gid, 0, -1)?;
+            }
+            if flags.dir_stats {
+                apply_dir_stats_delta(&tx, &[parent], 0, -align4k(0), -1)?;
+            }
             tx.execute(
                 "DELETE FROM jfs_dir_quota WHERE inode = ?1",
+                params![ino_raw],
+            )?;
+            tx.execute(
+                "DELETE FROM jfs_dirstats WHERE inode = ?1",
                 params![ino_raw],
             )?;
             delete_inode_auxiliary(&tx, ino_raw)?;
@@ -1357,7 +1612,20 @@ impl Meta for SqliteMeta {
                 params![parent.as_u64() as i64],
             )?;
             let _ = next_counter(&tx, "usedInodes", -1)?;
-            update_parent_mtime(&tx, parent, now_ns())?;
+            let now = now_ns();
+            if flags.change_log {
+                record_changelog(
+                    &tx,
+                    &serde_json::json!({
+                        "op": "RMDIR",
+                        "parent": parent.as_u64(),
+                        "name": name,
+                        "inode": ino_raw as u64,
+                        "ts": now,
+                    }),
+                )?;
+            }
+            update_parent_mtime(&tx, parent, now)?;
             tx.commit()?;
             Ok(())
         })
@@ -1375,78 +1643,8 @@ impl Meta for SqliteMeta {
         validate_name(dst_name)?;
         let src_name = src_name.to_owned();
         let dst_name = dst_name.to_owned();
-        self.run(move |conn| {
-            let tx = conn.transaction()?;
-            let src_row: Option<(i64, u8)> = tx
-                .query_row(
-                    "SELECT inode, type FROM jfs_edge WHERE parent = ?1 AND name = ?2",
-                    params![src_parent.as_u64() as i64, src_name.as_bytes()],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let (src_ino_raw, src_typ) =
-                src_row.ok_or_else(|| MetaError::NotFound(src_name.clone()))?;
-            let dst_parent_attr = read_attr(&tx, dst_parent)?;
-            if !dst_parent_attr.is_dir() {
-                return Err(MetaError::NotDir(format!("inode {dst_parent}")));
-            }
-
-            if src_parent == dst_parent && src_name == dst_name {
-                return Ok(());
-            }
-
-            remove_existing_dst(&tx, dst_parent, &dst_name)?;
-
-            let is_dir = NodeType::try_from(src_typ)? == NodeType::Directory;
-            if src_parent != dst_parent {
-                let src_ino = Ino(src_ino_raw as u64);
-                let (moved_space, moved_inodes) = if is_dir {
-                    let (s, i) = calc_dir_descendant_usage(&tx, src_ino)?;
-                    (s, i + 1)
-                } else {
-                    let src_attr = read_attr(&tx, src_ino)?;
-                    (src_attr.length as i64, 1)
-                };
-                apply_quota_delta(&tx, src_parent, -moved_space, -moved_inodes)?;
-                apply_quota_delta(&tx, dst_parent, moved_space, moved_inodes)?;
-            }
-
-            tx.execute(
-                "DELETE FROM jfs_edge WHERE parent = ?1 AND name = ?2",
-                params![src_parent.as_u64() as i64, src_name.as_bytes()],
-            )?;
-            tx.execute(
-                "INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    dst_parent.as_u64() as i64,
-                    dst_name.as_bytes(),
-                    src_ino_raw,
-                    src_typ
-                ],
-            )?;
-            if is_dir && src_parent != dst_parent {
-                tx.execute(
-                    "UPDATE jfs_node SET nlink = MAX(2, nlink - 1) WHERE inode = ?1",
-                    params![src_parent.as_u64() as i64],
-                )?;
-                tx.execute(
-                    "UPDATE jfs_node SET nlink = nlink + 1 WHERE inode = ?1",
-                    params![dst_parent.as_u64() as i64],
-                )?;
-            }
-            tx.execute(
-                "UPDATE jfs_node SET parent = ?1 WHERE inode = ?2 AND parent != 0",
-                params![dst_parent.as_u64() as i64, src_ino_raw],
-            )?;
-            let now = now_ns();
-            update_parent_mtime(&tx, src_parent, now)?;
-            if dst_parent != src_parent {
-                update_parent_mtime(&tx, dst_parent, now)?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await
+        self.run(move |conn| rename_sync(conn, src_parent, &src_name, dst_parent, &dst_name))
+            .await
     }
 
     async fn readdir(&self, inode: Ino) -> Result<Vec<Entry>, MetaError> {
@@ -1524,6 +1722,7 @@ impl Meta for SqliteMeta {
     ) -> Result<Attr, MetaError> {
         self.run(move |conn| {
             let tx = conn.transaction()?;
+            let flags = load_format_flags(&tx)?;
             let mut attr = read_attr(&tx, inode)?;
             if !attr.is_file() {
                 return Err(MetaError::IsDir(format!("inode {inode}")));
@@ -1572,6 +1771,18 @@ impl Meta for SqliteMeta {
                 let delta = (final_len - old_len) as i64;
                 let parent_dirs = file_parent_dirs(&tx, inode, &attr)?;
                 apply_quota_delta_dirs(&tx, &parent_dirs, delta, 0)?;
+                if flags.user_group_quota {
+                    apply_ug_quota_delta(&tx, attr.uid, attr.gid, delta, 0)?;
+                }
+                if flags.dir_stats {
+                    apply_dir_stats_delta(
+                        &tx,
+                        &parent_dirs,
+                        delta,
+                        align4k(final_len) - align4k(old_len),
+                        0,
+                    )?;
+                }
                 let _ = next_counter(&tx, "usedSpace", delta)?;
             }
             attr.length = final_len;
@@ -1584,6 +1795,20 @@ impl Meta for SqliteMeta {
                 "UPDATE jfs_node SET length = ?1, mtime = ?2, mtimensec = ?3, ctime = ?2, ctimensec = ?3 WHERE inode = ?4",
                 params![final_len as i64, us, sub, inode.as_u64() as i64],
             )?;
+            if flags.change_log {
+                record_changelog(
+                    &tx,
+                    &serde_json::json!({
+                        "op": "WRITE",
+                        "inode": inode.as_u64(),
+                        "indx": indx,
+                        "pos": pos,
+                        "len": slice.len,
+                        "length": final_len,
+                        "ts": now,
+                    }),
+                )?;
+            }
             tx.commit()?;
             Ok(attr)
         })
@@ -1593,6 +1818,7 @@ impl Meta for SqliteMeta {
     async fn truncate(&self, inode: Ino, length: u64) -> Result<Attr, MetaError> {
         self.run(move |conn| {
             let tx = conn.transaction()?;
+            let flags = load_format_flags(&tx)?;
             let mut attr = read_attr(&tx, inode)?;
             if !attr.is_file() {
                 return Err(MetaError::IsDir(format!("inode {inode}")));
@@ -1628,10 +1854,19 @@ impl Meta for SqliteMeta {
                 }
             }
             let delta = length as i64 - old_len as i64;
-            if delta != 0 {
+            let delta_space = align4k(length) - align4k(old_len);
+            if delta != 0 || (flags.dir_stats && delta_space != 0) {
                 let parent_dirs = file_parent_dirs(&tx, inode, &attr)?;
-                apply_quota_delta_dirs(&tx, &parent_dirs, delta, 0)?;
-                let _ = next_counter(&tx, "usedSpace", delta)?;
+                if delta != 0 {
+                    apply_quota_delta_dirs(&tx, &parent_dirs, delta, 0)?;
+                    if flags.user_group_quota {
+                        apply_ug_quota_delta(&tx, attr.uid, attr.gid, delta, 0)?;
+                    }
+                    let _ = next_counter(&tx, "usedSpace", delta)?;
+                }
+                if flags.dir_stats {
+                    apply_dir_stats_delta(&tx, &parent_dirs, delta, delta_space, 0)?;
+                }
             }
             let now = now_ns();
             let (us, sub) = split_ns(now);
@@ -2099,6 +2334,15 @@ impl Meta for SqliteMeta {
                 (attr.length as i64, 1)
             };
             apply_quota_delta(&tx, parent, -moved_space, -moved_inodes)?;
+            if fmt.dir_stats {
+                let (stat_len, stat_space, stat_inodes) = if is_dir {
+                    calc_dir_descendant_stats(&tx, ino)?
+                } else {
+                    let attr = read_attr(&tx, ino)?;
+                    (attr.length as i64, align4k(attr.length), 1)
+                };
+                apply_dir_stats_delta(&tx, &[parent], -stat_len, -stat_space, -stat_inodes)?;
+            }
 
             tx.execute(
                 "DELETE FROM jfs_edge WHERE parent = ?1 AND name = ?2",
@@ -2202,6 +2446,16 @@ impl Meta for SqliteMeta {
                 (attr.length as i64, 1)
             };
             apply_quota_delta(&tx, orig_parent, restored_space, restored_inodes)?;
+            let flags = load_format_flags(&tx)?;
+            if flags.dir_stats {
+                let (stat_len, stat_space, stat_inodes) = if is_dir {
+                    calc_dir_descendant_stats(&tx, ino)?
+                } else {
+                    let attr = read_attr(&tx, ino)?;
+                    (attr.length as i64, align4k(attr.length), 1)
+                };
+                apply_dir_stats_delta(&tx, &[orig_parent], stat_len, stat_space, stat_inodes)?;
+            }
 
             tx.execute(
                 "DELETE FROM jfs_edge WHERE parent = ?1 AND name = ?2",
@@ -2389,6 +2643,366 @@ impl Meta for SqliteMeta {
         })
         .await
     }
+
+    async fn get_dir_stat(&self, inode: Ino) -> Result<DirStat, MetaError> {
+        self.run(move |conn| {
+            let attr = read_attr(conn, inode)?;
+            if !attr.is_dir() {
+                return Err(MetaError::NotDir(format!("inode {inode}")));
+            }
+            let stat: Option<DirStat> = conn
+                .query_row(
+                    "SELECT data_length, used_space, used_inodes FROM jfs_dirstats WHERE inode = ?1",
+                    params![inode.as_u64() as i64],
+                    |r| {
+                        Ok(DirStat {
+                            data_length: r.get(0)?,
+                            used_space: r.get(1)?,
+                            used_inodes: r.get(2)?,
+                        })
+                    },
+                )
+                .optional()?;
+            Ok(stat.unwrap_or_default())
+        })
+        .await
+    }
+
+    async fn set_ug_quota(
+        &self,
+        target: QuotaTarget,
+        max_space: i64,
+        max_inodes: i64,
+    ) -> Result<Quota, MetaError> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let (qtype, qkey) = ug_quota_key(target);
+            let existing: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT used_space, used_inodes FROM jfs_ug_quota WHERE qtype = ?1 AND qkey = ?2",
+                    params![qtype, qkey],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let (used_space, used_inodes) = if let Some(pair) = existing {
+                pair
+            } else {
+                let sql = match target {
+                    QuotaTarget::User(_) => {
+                        "SELECT COALESCE(SUM(CASE WHEN type = 1 THEN length ELSE 0 END), 0), COUNT(1)
+                         FROM jfs_node WHERE uid = ?1 AND inode > 1 AND inode < ?2"
+                    }
+                    QuotaTarget::Group(_) => {
+                        "SELECT COALESCE(SUM(CASE WHEN type = 1 THEN length ELSE 0 END), 0), COUNT(1)
+                         FROM jfs_node WHERE gid = ?1 AND inode > 1 AND inode < ?2"
+                    }
+                };
+                tx.query_row(sql, params![qkey, TRASH_INODE.as_u64() as i64], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })?
+            };
+            tx.execute(
+                "INSERT INTO jfs_ug_quota (qtype, qkey, max_space, max_inodes, used_space, used_inodes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(qtype, qkey) DO UPDATE SET max_space = ?3, max_inodes = ?4",
+                params![qtype, qkey, max_space, max_inodes, used_space, used_inodes],
+            )?;
+            tx.commit()?;
+            Ok(Quota {
+                max_space,
+                max_inodes,
+                used_space,
+                used_inodes,
+            })
+        })
+        .await
+    }
+
+    async fn get_ug_quota(&self, target: QuotaTarget) -> Result<Quota, MetaError> {
+        self.run(move |conn| {
+            read_ug_quota_opt(conn, target)?
+                .ok_or_else(|| MetaError::NotFound(format!("ug quota for {target:?}")))
+        })
+        .await
+    }
+
+    async fn del_ug_quota(&self, target: QuotaTarget) -> Result<(), MetaError> {
+        self.run(move |conn| {
+            let (qtype, qkey) = ug_quota_key(target);
+            let changed = conn.execute(
+                "DELETE FROM jfs_ug_quota WHERE qtype = ?1 AND qkey = ?2",
+                params![qtype, qkey],
+            )?;
+            if changed == 0 {
+                return Err(MetaError::NotFound(format!("ug quota for {target:?}")));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_ug_quotas(&self) -> Result<Vec<(QuotaTarget, Quota)>, MetaError> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT qtype, qkey, max_space, max_inodes, used_space, used_inodes
+                 FROM jfs_ug_quota ORDER BY qtype, qkey",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, u8>(0)?,
+                    r.get::<_, i64>(1)?,
+                    Quota {
+                        max_space: r.get(2)?,
+                        max_inodes: r.get(3)?,
+                        used_space: r.get(4)?,
+                        used_inodes: r.get(5)?,
+                    },
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (qtype, qkey, quota) = row?;
+                out.push((ug_quota_from_row(qtype, qkey)?, quota));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn read_changelog(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<ChangeLogEntry>, MetaError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, entry FROM jfs_changelog WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![after_id, limit_i64], |r| {
+                Ok(ChangeLogEntry {
+                    id: r.get(0)?,
+                    entry: r.get(1)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn new_session(
+        &self,
+        mount_point: &str,
+        ttl_secs: i64,
+    ) -> Result<SessionInfo, MetaError> {
+        let mount_point = mount_point.to_owned();
+        let info = encode_session_info(&mount_point)?;
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let sid = next_counter(&tx, "nextSession", 1)? as u64;
+            let expire = now_secs() + ttl_secs;
+            tx.execute(
+                "INSERT INTO jfs_session2 (sid, expire, info) VALUES (?1, ?2, ?3)",
+                params![sid as i64, expire, info],
+            )?;
+            tx.commit()?;
+            Ok(SessionInfo {
+                sid,
+                expire,
+                mount_point,
+            })
+        })
+        .await
+    }
+
+    async fn heartbeat(&self, sid: u64, ttl_secs: i64) -> Result<(), MetaError> {
+        self.run(move |conn| {
+            let expire = now_secs() + ttl_secs;
+            let changed = conn.execute(
+                "UPDATE jfs_session2 SET expire = ?1 WHERE sid = ?2",
+                params![expire, sid as i64],
+            )?;
+            if changed == 0 {
+                return Err(MetaError::NotFound(format!("session {sid}")));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn close_session(&self, sid: u64) -> Result<(), MetaError> {
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            let sid_raw = sid as i64;
+            let changed =
+                tx.execute("DELETE FROM jfs_session2 WHERE sid = ?1", params![sid_raw])?;
+            if changed == 0 {
+                return Err(MetaError::NotFound(format!("session {sid}")));
+            }
+            tx.execute("DELETE FROM jfs_flock WHERE sid = ?1", params![sid_raw])?;
+            tx.execute("DELETE FROM jfs_plock WHERE sid = ?1", params![sid_raw])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<SessionInfo>, MetaError> {
+        self.run(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT sid, expire, info FROM jfs_session2 ORDER BY sid ASC")?;
+            let rows = stmt.query_map([], |r| {
+                let sid = r.get::<_, i64>(0)? as u64;
+                let expire = r.get::<_, i64>(1)?;
+                let info: Option<Vec<u8>> = r.get(2)?;
+                Ok(SessionInfo {
+                    sid,
+                    expire,
+                    mount_point: decode_session_mount_point(info.as_deref().unwrap_or(&[])),
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn cleanup_stale_sessions(&self) -> Result<u64, MetaError> {
+        self.run(|conn| {
+            let tx = conn.transaction()?;
+            let now = now_secs();
+            let mut stmt = tx.prepare("SELECT sid FROM jfs_session2 WHERE expire <= ?1")?;
+            let rows = stmt.query_map(params![now], |r| r.get::<_, i64>(0))?;
+            let mut stale_sids = Vec::new();
+            for row in rows {
+                stale_sids.push(row?);
+            }
+            drop(stmt);
+
+            for sid_raw in &stale_sids {
+                tx.execute("DELETE FROM jfs_flock WHERE sid = ?1", params![sid_raw])?;
+                tx.execute("DELETE FROM jfs_plock WHERE sid = ?1", params![sid_raw])?;
+            }
+            let deleted =
+                tx.execute("DELETE FROM jfs_session2 WHERE expire <= ?1", params![now])?;
+            tx.commit()?;
+            Ok(deleted as u64)
+        })
+        .await
+    }
+}
+
+fn rename_sync(
+    conn: &mut Connection,
+    src_parent: Ino,
+    src_name: &str,
+    dst_parent: Ino,
+    dst_name: &str,
+) -> Result<(), MetaError> {
+    let tx = conn.transaction()?;
+    let flags = load_format_flags(&tx)?;
+    let src_row: Option<(i64, u8)> = tx
+        .query_row(
+            "SELECT inode, type FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+            params![src_parent.as_u64() as i64, src_name.as_bytes()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (src_ino_raw, src_typ) = src_row.ok_or_else(|| MetaError::NotFound(src_name.to_owned()))?;
+    let dst_parent_attr = read_attr(&tx, dst_parent)?;
+    if !dst_parent_attr.is_dir() {
+        return Err(MetaError::NotDir(format!("inode {dst_parent}")));
+    }
+
+    if src_parent == dst_parent && src_name == dst_name {
+        return Ok(());
+    }
+
+    remove_existing_dst(&tx, dst_parent, dst_name, flags)?;
+
+    let is_dir = NodeType::try_from(src_typ)? == NodeType::Directory;
+    if src_parent != dst_parent {
+        let src_ino = Ino(src_ino_raw as u64);
+        let (moved_space, moved_inodes) = if is_dir {
+            let (s, i) = calc_dir_descendant_usage(&tx, src_ino)?;
+            (s, i + 1)
+        } else {
+            let src_attr = read_attr(&tx, src_ino)?;
+            (src_attr.length as i64, 1)
+        };
+        apply_quota_delta(&tx, src_parent, -moved_space, -moved_inodes)?;
+        apply_quota_delta(&tx, dst_parent, moved_space, moved_inodes)?;
+
+        if flags.dir_stats {
+            let (stat_len, stat_space, stat_inodes) = if is_dir {
+                calc_dir_descendant_stats(&tx, src_ino)?
+            } else {
+                let src_attr = read_attr(&tx, src_ino)?;
+                (src_attr.length as i64, align4k(src_attr.length), 1)
+            };
+            apply_dir_stats_delta(&tx, &[src_parent], -stat_len, -stat_space, -stat_inodes)?;
+            apply_dir_stats_delta(&tx, &[dst_parent], stat_len, stat_space, stat_inodes)?;
+        }
+    }
+
+    tx.execute(
+        "DELETE FROM jfs_edge WHERE parent = ?1 AND name = ?2",
+        params![src_parent.as_u64() as i64, src_name.as_bytes()],
+    )?;
+    tx.execute(
+        "INSERT INTO jfs_edge (parent, name, inode, type) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            dst_parent.as_u64() as i64,
+            dst_name.as_bytes(),
+            src_ino_raw,
+            src_typ
+        ],
+    )?;
+    if is_dir && src_parent != dst_parent {
+        tx.execute(
+            "UPDATE jfs_node SET nlink = MAX(2, nlink - 1) WHERE inode = ?1",
+            params![src_parent.as_u64() as i64],
+        )?;
+        tx.execute(
+            "UPDATE jfs_node SET nlink = nlink + 1 WHERE inode = ?1",
+            params![dst_parent.as_u64() as i64],
+        )?;
+    }
+    tx.execute(
+        "UPDATE jfs_node SET parent = ?1 WHERE inode = ?2 AND parent != 0",
+        params![dst_parent.as_u64() as i64, src_ino_raw],
+    )?;
+    let now = now_ns();
+    if flags.change_log {
+        record_changelog(
+            &tx,
+            &serde_json::json!({
+                "op": "RENAME",
+                "src_parent": src_parent.as_u64(),
+                "src_name": src_name,
+                "dst_parent": dst_parent.as_u64(),
+                "dst_name": dst_name,
+                "inode": src_ino_raw as u64,
+                "ts": now,
+            }),
+        )?;
+    }
+    update_parent_mtime(&tx, src_parent, now)?;
+    if dst_parent != src_parent {
+        update_parent_mtime(&tx, dst_parent, now)?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn clone_node_recursive(
