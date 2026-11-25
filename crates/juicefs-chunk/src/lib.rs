@@ -63,6 +63,24 @@ fn parse_block_orig_size(key: &str) -> Option<usize> {
     tail.parse::<usize>().ok()
 }
 
+async fn upload_block(
+    inner: Arc<ChunkStoreInner>,
+    key: String,
+    raw: Bytes,
+) -> Result<(), ChunkError> {
+    let compressed = inner.algo.compress(&raw)?;
+    let up_limiter = inner.upload_limit.read().expect("lock poisoned").clone();
+    if let Some(limiter) = up_limiter {
+        limiter.acquire(compressed.len() as u64).await;
+    }
+    inner.store.put(&key, Bytes::from(compressed)).await?;
+    inner.mem_cache.insert(key.clone(), raw.clone());
+    if let Some(dc) = &inner.disk_cache {
+        dc.put(&key, &raw).await?;
+    }
+    Ok(())
+}
+
 /// Chunk store backed by an [`ObjectStorage`], compression, `SingleFlight` deduplication,
 /// background [`Prefetcher`], optional [`TokenBucket`] rate limits, and multi-tier caches.
 #[derive(Debug, Clone)]
@@ -348,24 +366,17 @@ impl CachedChunkStore {
             }
             return Ok(());
         }
+        if data.len() <= bsize {
+            let key = block_key(slice_id, 0, data.len(), self.inner.config.hash_prefix);
+            let raw = Bytes::copy_from_slice(data);
+            return upload_block(Arc::clone(&self.inner), key, raw).await;
+        }
         let mut join_set = JoinSet::new();
         for (idx, block) in data.chunks(bsize).enumerate() {
             let key = block_key(slice_id, idx, block.len(), self.inner.config.hash_prefix);
             let inner = Arc::clone(&self.inner);
             let raw = Bytes::copy_from_slice(block);
-            join_set.spawn(async move {
-                let compressed = inner.algo.compress(&raw)?;
-                let up_limiter = inner.upload_limit.read().expect("lock poisoned").clone();
-                if let Some(limiter) = up_limiter {
-                    limiter.acquire(compressed.len() as u64).await;
-                }
-                inner.store.put(&key, Bytes::from(compressed)).await?;
-                inner.mem_cache.insert(key.clone(), raw.clone());
-                if let Some(dc) = &inner.disk_cache {
-                    dc.put(&key, &raw).await?;
-                }
-                Ok::<(), ChunkError>(())
-            });
+            join_set.spawn(upload_block(inner, key, raw));
         }
         while let Some(res) = join_set.join_next().await {
             res.map_err(|e| ChunkError::Io(std::io::Error::other(e.to_string())))??;

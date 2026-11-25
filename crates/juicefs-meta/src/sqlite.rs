@@ -155,6 +155,9 @@ impl SqliteMeta {
         conn.execute_batch(
             "PRAGMA synchronous = NORMAL;
              PRAGMA journal_mode = WAL;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA mmap_size = 268435456;
+             PRAGMA cache_size = -65536;
              PRAGMA busy_timeout = 5000;",
         )?;
         let has_schema: Option<i64> = conn
@@ -192,6 +195,9 @@ impl SqliteMeta {
         conn.execute_batch(
             "PRAGMA synchronous = NORMAL;
              PRAGMA journal_mode = WAL;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA mmap_size = 268435456;
+             PRAGMA cache_size = -65536;
              PRAGMA busy_timeout = 5000;",
         )?;
         let format_json = serde_json::to_string(format)?;

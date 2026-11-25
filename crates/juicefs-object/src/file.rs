@@ -166,11 +166,17 @@ impl ObjectStorage for FileStore {
     async fn put(&self, key: &str, data: Bytes) -> Result<(), ObjectError> {
         let path = self.resolve_path(key)?;
         if self.inplace {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).await?;
+            match fs::write(&path, &data).await {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent).await?;
+                    }
+                    fs::write(&path, &data).await?;
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
             }
-            fs::write(&path, &data).await?;
-            return Ok(());
         }
         write_atomic(&path, &data).await
     }
